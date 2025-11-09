@@ -1,5 +1,5 @@
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification
@@ -37,17 +37,34 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
     model.train()
     progress_bar = tqdm(range(num_training_steps))
 
-    ################################
-    ##### YOUR CODE BEGINGS HERE ###
-
     # Implement the training loop --- make sure to use the optimizer and lr_sceduler (learning rate scheduler)
     # Remember that pytorch uses gradient accumumlation so you need to use zero_grad (https://pytorch.org/tutorials/recipes/recipes/zeroing_out_gradients.html)
     # You can use progress_bar.update(1) to see the progress during training
     # You can refer to the pytorch tutorial covered in class for reference
 
-    raise NotImplementedError
+    model.train()
+    step = 0
+    for epoch in range(num_epochs):
+        for batch in train_dataloader:
+            # move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-    ##### YOUR CODE ENDS HERE ######
+            # forward
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # step
+            optimizer.step()
+            lr_scheduler.step()
+
+            # progress
+            progress_bar.update(1)
+            step += 1
 
     print("Training completed...")
     print("Saving Model....")
@@ -76,8 +93,8 @@ def do_eval(eval_dataloader, output_dir, out_file):
 
         # write to output file
         for pred, label in zip(predictions, batch["labels"]):
-                out_file.write(f"{pred.item()}\n")
-                out_file.write(f"{label.item()}\n")
+            out_file.write(f"{pred.item()}\n")
+            out_file.write(f"{label.item()}\n")
     out_file.close()
     score = metric.compute()
 
@@ -86,16 +103,36 @@ def do_eval(eval_dataloader, output_dir, out_file):
 
 # Created a dataladoer for the augmented training dataset
 def create_augmented_dataloader(args, dataset):
-    ################################
-    ##### YOUR CODE BEGINGS HERE ###
-
     # Here, 'dataset' is the original dataset. You should return a dataloader called 'train_dataloader' -- this
     # dataloader will be for the original training split augmented with 5k random transformed examples from the training set.
     # You may find it helpful to see how the dataloader was created at other place in this code.
+    rng = random.Random(3407)
 
-    raise NotImplementedError
+    # 1) Sample 5,000 random indices from the TRAIN split
+    train_ds_raw = dataset["train"]
+    n = len(train_ds_raw)
+    k = min(5000, n)
+    idx = rng.sample(range(n), k)
 
-    ##### YOUR CODE ENDS HERE ######
+    sampled_raw = train_ds_raw.select(idx)
+
+    # 2) Apply your OOD transform to the sampled set
+    sampled_transformed = sampled_raw.map(
+        custom_transform, load_from_cache_file=False)
+
+    # 3) Concatenate: full original train + 5k transformed
+    augmented_raw = concatenate_datasets([train_ds_raw, sampled_transformed])
+
+    # 4) Tokenize -> torch tensors
+    augmented_tokenized = augmented_raw.map(
+        tokenize_function, batched=True, load_from_cache_file=False)
+    augmented_tokenized = augmented_tokenized.remove_columns(["text"])
+    augmented_tokenized = augmented_tokenized.rename_column("label", "labels")
+    augmented_tokenized.set_format("torch")
+
+    # 5) Build dataloader
+    train_dataloader = DataLoader(
+        augmented_tokenized, shuffle=True, batch_size=args.batch_size)
 
     return train_dataloader
 
@@ -105,7 +142,8 @@ def create_transformed_dataloader(args, dataset, debug_transformation):
     # Print 5 random transformed examples
     if debug_transformation:
         small_dataset = dataset["test"].shuffle(seed=42).select(range(5))
-        small_transformed_dataset = small_dataset.map(custom_transform, load_from_cache_file=False)
+        small_transformed_dataset = small_dataset.map(
+            custom_transform, load_from_cache_file=False)
         for k in range(5):
             print("Original Example ", str(k))
             print(small_dataset[k])
@@ -116,14 +154,19 @@ def create_transformed_dataloader(args, dataset, debug_transformation):
 
         exit()
 
-    transformed_dataset = dataset["test"].map(custom_transform, load_from_cache_file=False)
-    transformed_tokenized_dataset = transformed_dataset.map(tokenize_function, batched=True, load_from_cache_file=False)
-    transformed_tokenized_dataset = transformed_tokenized_dataset.remove_columns(["text"])
-    transformed_tokenized_dataset = transformed_tokenized_dataset.rename_column("label", "labels")
+    transformed_dataset = dataset["test"].map(
+        custom_transform, load_from_cache_file=False)
+    transformed_tokenized_dataset = transformed_dataset.map(
+        tokenize_function, batched=True, load_from_cache_file=False)
+    transformed_tokenized_dataset = transformed_tokenized_dataset.remove_columns([
+                                                                                 "text"])
+    transformed_tokenized_dataset = transformed_tokenized_dataset.rename_column(
+        "label", "labels")
     transformed_tokenized_dataset.set_format("torch")
 
     transformed_val_dataset = transformed_tokenized_dataset
-    eval_dataloader = DataLoader(transformed_val_dataset, batch_size=args.batch_size)
+    eval_dataloader = DataLoader(
+        transformed_val_dataset, batch_size=args.batch_size)
 
     return eval_dataloader
 
@@ -133,10 +176,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # Arguments
-    parser.add_argument("--train", action="store_true", help="train a model on the training data")
-    parser.add_argument("--train_augmented", action="store_true", help="train a model on the augmented training data")
-    parser.add_argument("--eval", action="store_true", help="evaluate model on the test set")
-    parser.add_argument("--eval_transformed", action="store_true", help="evaluate model on the transformed test set")
+    parser.add_argument("--train", action="store_true",
+                        help="train a model on the training data")
+    parser.add_argument("--train_augmented", action="store_true",
+                        help="train a model on the augmented training data")
+    parser.add_argument("--eval", action="store_true",
+                        help="evaluate model on the test set")
+    parser.add_argument("--eval_transformed", action="store_true",
+                        help="evaluate model on the transformed test set")
     parser.add_argument("--model_dir", type=str, default="./out")
     parser.add_argument("--debug_train", action="store_true",
                         help="use a subset for training to debug your training loop")
@@ -152,7 +199,8 @@ if __name__ == "__main__":
     global tokenizer
 
     # Device
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device(
+        "cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
@@ -166,26 +214,33 @@ if __name__ == "__main__":
     tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
     tokenized_dataset.set_format("torch")
 
-    small_train_dataset = tokenized_dataset["train"].shuffle(seed=42).select(range(4000))
-    small_eval_dataset = tokenized_dataset["test"].shuffle(seed=42).select(range(1000))
+    small_train_dataset = tokenized_dataset["train"].shuffle(
+        seed=42).select(range(4000))
+    small_eval_dataset = tokenized_dataset["test"].shuffle(
+        seed=42).select(range(1000))
 
     # Create dataloaders for iterating over the dataset
     if args.debug_train:
-        train_dataloader = DataLoader(small_train_dataset, shuffle=True, batch_size=args.batch_size)
-        eval_dataloader = DataLoader(small_eval_dataset, batch_size=args.batch_size)
+        train_dataloader = DataLoader(
+            small_train_dataset, shuffle=True, batch_size=args.batch_size)
+        eval_dataloader = DataLoader(
+            small_eval_dataset, batch_size=args.batch_size)
         print(f"Debug training...")
         print(f"len(train_dataloader): {len(train_dataloader)}")
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
     else:
-        train_dataloader = DataLoader(tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size)
-        eval_dataloader = DataLoader(tokenized_dataset["test"], batch_size=args.batch_size)
+        train_dataloader = DataLoader(
+            tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size)
+        eval_dataloader = DataLoader(
+            tokenized_dataset["test"], batch_size=args.batch_size)
         print(f"Actual training...")
         print(f"len(train_dataloader): {len(train_dataloader)}")
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
 
     # Train model on the original training dataset
     if args.train:
-        model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            "bert-base-cased", num_labels=2)
         model.to(device)
         do_train(args, model, train_dataloader, save_dir="./out")
         # Change eval dir
@@ -194,7 +249,8 @@ if __name__ == "__main__":
     # Train model on the augmented training dataset
     if args.train_augmented:
         train_dataloader = create_augmented_dataloader(args, dataset)
-        model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            "bert-base-cased", num_labels=2)
         model.to(device)
         do_train(args, model, train_dataloader, save_dir="./out_augmented")
         # Change eval dir
@@ -211,6 +267,7 @@ if __name__ == "__main__":
     if args.eval_transformed:
         out_file = os.path.basename(os.path.normpath(args.model_dir))
         out_file = out_file + "_transformed.txt"
-        eval_transformed_dataloader = create_transformed_dataloader(args, dataset, args.debug_transformation)
+        eval_transformed_dataloader = create_transformed_dataloader(
+            args, dataset, args.debug_transformation)
         score = do_eval(eval_transformed_dataloader, args.model_dir, out_file)
         print("Score: ", score)
