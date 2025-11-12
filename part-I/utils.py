@@ -23,33 +23,32 @@ def example_transform(example):
 # You can randomly select each word with some fixed probability to replace by a synonym.
 
 
-def custom_transform(example):
-    # Design and implement the transformation as mentioned in pdf
-    # You are free to implement any transformation but the comments at the top roughly describe
-    # how you could implement two of them --- synonym replacement and typos.
+# --- small helpers / lists ---
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "so", "very", "really", "just", "quite", "rather", "some", "any",
+    "many", "much", "more", "most", "also", "still", "even", "though", "while", "however", "indeed", "like"
+}
+SENTIMENT_POLAR = {"great", "excellent", "amazing", "awesome", "good", "fantastic", "favorite",
+                   "bad", "terrible", "awful", "horrible", "poor", "boring", "worst"}
+NEGATION_GUARDS = {"not", "n't", "never", "no"}
 
-    # You should update example["text"] using your transformation
+US_UK_MAP = {
+    "color": "colour", "colors": "colours", "favorite": "favourite", "honor": "honour",
+    "theater": "theatre", "center": "centre", "gray": "grey", "realize": "realise",
+    "organize": "organise", "apologize": "apologise", "catalog": "catalogue",
+    "program": "programme"  # context-dependent but fine for reviews
+}
+UK_US_MAP = {v: k for k, v in US_UK_MAP.items()}
 
-    # --- configuration (tuned to be "reasonable") ---
-    SYN_P = 0.10     # 10% chance per eligible token to get a synonym
-    TYPO_P = 0.06   # 6% chance per eligible token to get a realistic typo
-    rng = random.Random(3407)
+KEYBOARD_NEIGHBORS = {
+    'a': 'qs', 's': 'awed', 'd': 'sfe', 'f': 'drg', 'g': 'fty', 'h': 'gju',
+    'j': 'huik', 'k': 'jil', 'l': 'k', 'q': 'wa', 'w': 'qes', 'e': 'wrd',
+    'r': 'etf', 't': 'ryg', 'y': 'tuh', 'u': 'yij', 'i': 'uoj', 'o': 'ipk',
+    'p': 'o', 'z': 'x', 'x': 'zc', 'c': 'xv', 'v': 'cb', 'b': 'vn', 'n': 'bm', 'm': 'n'
+}
 
-    # Light guardrail: avoid directly flipping the most polar words
-    SENTIMENT_POLAR = {"great", "excellent", "amazing", "awesome", "good", "fantastic",
-                       "bad", "terrible", "awful", "horrible", "poor", "boring"}
 
-    NEGATION_GUARDS = {"not", "n't", "never", "no"}
-
-    # Keyboard neighbors for realistic typos (inner letters only)
-    KEYBOARD_NEIGHBORS = {
-        'a': 'qs', 's': 'awed', 'd': 'sfe', 'f': 'drg', 'g': 'fty', 'h': 'gju',
-        'j': 'huik', 'k': 'jil', 'l': 'k', 'q': 'wa', 'w': 'qes', 'e': 'wrd',
-        'r': 'etf', 't': 'ryg', 'y': 'tuh', 'u': 'yij', 'i': 'uoj', 'o': 'ipk',
-        'p': 'o', 'z': 'x', 'x': 'zc', 'c': 'xv', 'v': 'cb', 'b': 'vn', 'n': 'bm', 'm': 'n'
-    }
-
-    # Ensure NLTK data is available (fail-safe)
+def _maybe_download_wordnet():
     try:
         _ = wordnet.synsets("test")
     except LookupError:
@@ -58,47 +57,78 @@ def custom_transform(example):
             nltk.download("wordnet", quiet=True)
             nltk.download("omw-1.4", quiet=True)
         except Exception:
-            pass  # if offline, synonym step will just skip
+            pass
 
-    def _maybe_synonym(tok: str) -> str:
-        # Skip punctuation / numerics / very short
+
+def custom_transform(example):
+    # knobs (you can also pass via CLI and set here if you prefer)
+    SYN_P = 0.30   # ↑ from 0.15
+    TYPO_P = 0.15   # ↑ from 0.10
+    DROP_P = 0.08   # stopword dropout (keep negations)
+    LOCALE_P = 0.20  # US<->UK swap prob
+    PUNC_P = 0.10  # punctuation jitter
+
+    rng = random.Random(3407)
+    _maybe_download_wordnet()
+
+    def preserve_case(orig, rep):
+        return rep.capitalize() if orig[:1].isupper() else rep
+
+    def synonym(tok: str) -> str:
         if not tok.isalpha():
             return tok
         low = tok.lower()
-        if low in SENTIMENT_POLAR or low in NEGATION_GUARDS:  # keep strong polarity words intact
+        if low in SENTIMENT_POLAR or low in NEGATION_GUARDS:
             return tok
         if rng.random() > SYN_P:
             return tok
-        # Try to fetch a clean synonym from WordNet
         syns = wordnet.synsets(low)
         lemmas = []
         for s in syns:
             for l in s.lemmas():
                 cand = l.name().replace("_", " ")
-                # avoid identical, preserve simple alpha tokens
-                if cand.lower() != low and cand.isalpha():
+                if cand.isalpha() and cand.lower() != low:
                     lemmas.append(cand)
         if not lemmas:
             return tok
         rep = rng.choice(lemmas)
-        # preserve capitalization
-        if tok[0].isupper():
-            rep = rep.capitalize()
-        return rep
+        return preserve_case(tok, rep)
 
-    def _maybe_typo(tok: str) -> str:
+    def typo(tok: str) -> str:
         if len(tok) < 3 or rng.random() > TYPO_P:
             return tok
-        # change an inner character to a neighboring key or swap
-        i = rng.randint(1, len(tok) - 2)
-        c = tok[i].lower()
-        if c in KEYBOARD_NEIGHBORS and rng.random() < 0.7:
-            repl = rng.choice(list(KEYBOARD_NEIGHBORS[c]))
-            return tok[:i] + repl + tok[i+1:]
-        # fallback: swap adjacent
-        return tok[:i-1] + tok[i] + tok[i-1] + tok[i+1:]
+        choice = rng.random()
+        # 60% neighbor substitution, 20% deletion, 20% insertion/dup
+        if choice < 0.6:
+            i = rng.randint(1, len(tok)-2)
+            c = tok[i].lower()
+            if c in KEYBOARD_NEIGHBORS:
+                repl = rng.choice(list(KEYBOARD_NEIGHBORS[c]))
+                return tok[:i] + repl + tok[i+1:]
+            return tok
+        elif choice < 0.8:
+            i = rng.randint(1, len(tok)-2)
+            return tok[:i] + tok[i+1:]
+        else:
+            i = rng.randint(1, len(tok)-2)
+            c = tok[i]
+            return tok[:i] + c + tok[i:]  # duplicate a char
+        # (fallbacks keep token unchanged)
 
-    # Tokenize words (Treebank rules) and detokenize back
+    def locale_swap(tok: str) -> str:
+        low = tok.lower()
+        if rng.random() > LOCALE_P:
+            return tok
+        rep = None
+        if low in US_UK_MAP:
+            rep = US_UK_MAP[low]
+        elif low in UK_US_MAP:
+            rep = UK_US_MAP[low]
+        if rep is None:
+            return tok
+        return preserve_case(tok, rep)
+
+    # tokenization
     try:
         toks = word_tokenize(example["text"])
     except LookupError:
@@ -111,12 +141,22 @@ def custom_transform(example):
 
     new_toks = []
     for t in toks:
-        # Apply synonym (label-preserving) then a very light typo noise
-        t2 = _maybe_synonym(t)
-        t3 = _maybe_typo(t2)
+        low = t.lower()
+        # light dropout of harmless stopwords (never drop negations / sentiment)
+        if low in STOPWORDS and (low not in NEGATION_GUARDS) and (low not in SENTIMENT_POLAR):
+            if rng.random() < DROP_P:
+                continue
+
+        t1 = synonym(t)
+        t2 = locale_swap(t1)
+        t3 = typo(t2)
         new_toks.append(t3)
 
+    # punctuation jitter on the detokenized string
     detok = TreebankWordDetokenizer().detokenize(new_toks)
-    example["text"] = detok
+    if rng.random() < PUNC_P:
+        detok = detok.replace("...", " … ").replace(
+            "!", ".").replace(".", "…", 1)
 
+    example["text"] = detok
     return example
