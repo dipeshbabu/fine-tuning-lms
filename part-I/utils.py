@@ -31,8 +31,8 @@ def custom_transform(example):
     # You should update example["text"] using your transformation
 
     # --- configuration (tuned to be "reasonable") ---
-    SYN_P = 0.15     # 10% chance per eligible token to get a synonym
-    TYPO_P = 0.10    # 6% chance per eligible token to get a realistic typo
+    SYN_P = 0.15     # 15% chance per eligible token to get a synonym
+    TYPO_P = 0.10    # 10% chance per eligible token to get a realistic typo
     rng = random.Random(3407)
 
     # Light guardrail: avoid directly flipping the most polar words
