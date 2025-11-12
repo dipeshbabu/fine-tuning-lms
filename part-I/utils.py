@@ -39,6 +39,8 @@ def custom_transform(example):
     SENTIMENT_POLAR = {"great", "excellent", "amazing", "awesome", "good", "fantastic",
                        "bad", "terrible", "awful", "horrible", "poor", "boring"}
 
+    NEGATION_GUARDS = {"not", "n't", "never", "no"}
+
     # Keyboard neighbors for realistic typos (inner letters only)
     KEYBOARD_NEIGHBORS = {
         'a': 'qs', 's': 'awed', 'd': 'sfe', 'f': 'drg', 'g': 'fty', 'h': 'gju',
@@ -63,7 +65,7 @@ def custom_transform(example):
         if not tok.isalpha():
             return tok
         low = tok.lower()
-        if low in SENTIMENT_POLAR:  # keep strong polarity words intact
+        if low in SENTIMENT_POLAR or low in NEGATION_GUARDS:  # keep strong polarity words intact
             return tok
         if rng.random() > SYN_P:
             return tok
