@@ -227,9 +227,9 @@ if __name__ == "__main__":
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
     else:
         train_dataloader = DataLoader(
-            tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size, num_workers=2, pin_memory=True)
+            tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size)
         eval_dataloader = DataLoader(
-            tokenized_dataset["test"], batch_size=args.batch_size, num_workers=2, pin_memory=True)
+            tokenized_dataset["test"], batch_size=args.batch_size)
         print(f"Actual training...")
         print(f"len(train_dataloader): {len(train_dataloader)}")
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
