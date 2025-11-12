@@ -11,6 +11,7 @@ import evaluate
 import random
 import argparse
 from utils import *
+import utils as U
 import os
 
 # Set seed
@@ -23,7 +24,7 @@ torch.backends.cudnn.benchmark = False
 
 # Tokenize the input
 def tokenize_function(examples):
-    return tokenizer(examples["text"], padding="max_length", truncation=True)
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=args.max_length)
 
 
 # Core training function
@@ -42,29 +43,20 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
     # You can use progress_bar.update(1) to see the progress during training
     # You can refer to the pytorch tutorial covered in class for reference
 
-    model.train()
-    step = 0
     for epoch in range(num_epochs):
         for batch in train_dataloader:
-            # move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # forward
             outputs = model(**batch)
             loss = outputs.loss
 
-            # backward
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            # step
             optimizer.step()
             lr_scheduler.step()
 
-            # progress
             progress_bar.update(1)
-            step += 1
 
     print("Training completed...")
     print("Saving Model....")
@@ -192,8 +184,13 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--syn_p", type=float, default=0.10)
+    parser.add_argument("--typo_p", type=float, default=0.06)
 
     args = parser.parse_args()
+
+    U.SYN_P = args.syn_p
+    U.TYPO_P = args.typo_p
 
     global device
     global tokenizer
@@ -230,9 +227,9 @@ if __name__ == "__main__":
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
     else:
         train_dataloader = DataLoader(
-            tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size)
+            tokenized_dataset["train"], shuffle=True, batch_size=args.batch_size, num_workers=2, pin_memory=True)
         eval_dataloader = DataLoader(
-            tokenized_dataset["test"], batch_size=args.batch_size)
+            tokenized_dataset["test"], batch_size=args.batch_size, num_workers=2, pin_memory=True)
         print(f"Actual training...")
         print(f"len(train_dataloader): {len(train_dataloader)}")
         print(f"len(eval_dataloader): {len(eval_dataloader)}")
