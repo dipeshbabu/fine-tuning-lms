@@ -1,15 +1,4 @@
-import datasets
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader
-from transformers import AutoModelForSequenceClassification
-from torch.optim import AdamW
-from transformers import get_scheduler
-import torch
-from tqdm.auto import tqdm
-import evaluate
 import random
-import argparse
 from nltk.corpus import wordnet
 from nltk import word_tokenize
 from nltk.tokenize.treebank import TreebankWordDetokenizer
@@ -42,8 +31,8 @@ def custom_transform(example):
     # You should update example["text"] using your transformation
 
     # --- configuration (tuned to be "reasonable") ---
-    SYN_P = 0.10     # 10% chance per eligible token to get a synonym
-    TYPO_P = 0.06    # 6% chance per eligible token to get a realistic typo
+    SYN_P = 0.15     # 10% chance per eligible token to get a synonym
+    TYPO_P = 0.10    # 6% chance per eligible token to get a realistic typo
     rng = random.Random(3407)
 
     # Light guardrail: avoid directly flipping the most polar words
