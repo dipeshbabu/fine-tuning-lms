@@ -24,7 +24,7 @@ torch.backends.cudnn.benchmark = False
 
 # Tokenize the input
 def tokenize_function(examples):
-    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=args.max_length)
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=MAX_LEN)
 
 
 # Core training function
@@ -186,8 +186,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--syn_p", type=float, default=0.10)
     parser.add_argument("--typo_p", type=float, default=0.06)
+    parser.add_argument("--max_length", type=int, default=256)
 
     args = parser.parse_args()
+
+    global MAX_LEN
+    MAX_LEN = args.max_length
 
     U.SYN_P = args.syn_p
     U.TYPO_P = args.typo_p
