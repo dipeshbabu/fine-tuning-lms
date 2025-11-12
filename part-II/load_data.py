@@ -1,17 +1,31 @@
-import os, random, re, string
-from collections import Counter
-from tqdm import tqdm
-import pickle
+import torch
+from transformers import T5TokenizerFast
+import os
 
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
 import nltk
 nltk.download('punkt')
-from transformers import T5TokenizerFast
-import torch
 
 PAD_IDX = 0
+DEVICE = torch.device(
+    'cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+def _shift_right(labels, pad_token_id: int):
+    """Create decoder inputs by shifting targets to the right (T5-style)."""
+    bsz, seqlen = labels.shape
+    start_tokens = torch.full((bsz, 1), pad_token_id, dtype=labels.dtype)
+    shifted = torch.cat([start_tokens, labels[:, :-1]], dim=1)
+    return shifted
+
+
+def load_lines(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f.readlines()]
+    return lines
+
 
 class T5Dataset(Dataset):
 
@@ -26,16 +40,67 @@ class T5Dataset(Dataset):
               T5Tokenizer should serve that purpose.
             * Class behavior should be different on the test set.
         '''
-        # TODO
+        self.data_folder = data_folder
+        self.split = split
+        self.tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+        # T5 uses pad token id = 0; also serves as decoder_start_token_id
+        self.pad_id = self.tokenizer.pad_token_id
+
+        self.items = self.process_data(data_folder, split, self.tokenizer)
 
     def process_data(self, data_folder, split, tokenizer):
-        # TODO
-    
+        nl_path = os.path.join(data_folder, f"{split}.nl")
+        nl = load_lines(nl_path)
+
+        items = []
+        if split == "test":
+            # no SQL for test
+            for x in nl:
+                items.append({"nl": x, "sql": None})
+        else:
+            sql_path = os.path.join(data_folder, f"{split}.sql")
+            sql = load_lines(sql_path)
+            assert len(nl) == len(sql), f"NL/SQL size mismatch for {split}"
+            for x, y in zip(nl, sql):
+                items.append({"nl": x, "sql": y})
+        return items
+
     def __len__(self):
-        # TODO
+        return len(self.items)
 
     def __getitem__(self, idx):
-        # TODO
+        ex = self.items[idx]
+        nl = ex["nl"]
+        # (Optional) small task prefix helps T5 a bit
+        nl_in = f"translate to SQL: {nl}"
+
+        enc = self.tokenizer(nl_in, truncation=True,
+                             max_length=256, return_tensors=None)
+        enc_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
+
+        if self.split == "test":
+            # For test we only return encoder inputs
+            return {
+                "encoder_ids": enc_ids,
+            }
+
+        sql = ex["sql"]
+        dec = self.tokenizer(sql, truncation=True,
+                             max_length=256, return_tensors=None)
+        dec_ids = torch.tensor(dec["input_ids"], dtype=torch.long)
+
+        # Targets (labels). We keep pad tokens = 0; loss will mask them later in loop
+        labels = dec_ids
+
+        # first decoder token to feed when generating (T5 uses pad token id to start)
+        initial_dec_inp = torch.tensor([self.pad_id], dtype=torch.long)
+
+        return {
+            "encoder_ids": enc_ids,
+            "decoder_labels": labels,
+            "initial_decoder_input": initial_dec_inp
+        }
+
 
 def normal_collate_fn(batch):
     '''
@@ -53,8 +118,22 @@ def normal_collate_fn(batch):
         * decoder_targets: The target tokens with which to train the decoder (the tokens following each decoder input)
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
-    # TODO
-    return [], [], [], [], []
+    encs = [b["encoder_ids"] for b in batch]
+    dec_tgts = [b["decoder_labels"] for b in batch]
+    init_inputs = [b["initial_decoder_input"] for b in batch]
+
+    enc_padded = pad_sequence(encs, batch_first=True, padding_value=PAD_IDX)
+    enc_mask = (enc_padded != PAD_IDX).long()
+
+    tgt_padded = pad_sequence(
+        dec_tgts, batch_first=True, padding_value=PAD_IDX)
+    # Shift-right to get decoder inputs
+    dec_inputs = _shift_right(tgt_padded, pad_token_id=PAD_IDX)
+    init_padded = pad_sequence(
+        init_inputs, batch_first=True, padding_value=PAD_IDX)
+
+    return enc_padded, enc_mask, dec_inputs, tgt_padded, init_padded
+
 
 def test_collate_fn(batch):
     '''
@@ -69,8 +148,13 @@ def test_collate_fn(batch):
         * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
-    # TODO
-    return [], [], []
+    encs = [b["encoder_ids"] for b in batch]
+    enc_padded = pad_sequence(encs, batch_first=True, padding_value=PAD_IDX)
+    enc_mask = (enc_padded != PAD_IDX).long()
+    # T5 starts decoder with pad token id
+    initial_dec = torch.full((len(batch), 1), PAD_IDX, dtype=torch.long)
+    return enc_padded, enc_mask, initial_dec
+
 
 def get_dataloader(batch_size, split):
     data_folder = 'data'
@@ -78,14 +162,15 @@ def get_dataloader(batch_size, split):
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
 
-    dataloader = DataLoader(dset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+    dataloader = DataLoader(dset, batch_size=batch_size,
+                            shuffle=shuffle, collate_fn=collate_fn)
     return dataloader
+
 
 def load_t5_data(batch_size, test_batch_size):
     train_loader = get_dataloader(batch_size, "train")
     dev_loader = get_dataloader(test_batch_size, "dev")
     test_loader = get_dataloader(test_batch_size, "test")
-    
     return train_loader, dev_loader, test_loader
 
 
@@ -95,6 +180,11 @@ def load_lines(path):
         lines = [line.strip() for line in lines]
     return lines
 
+
 def load_prompting_data(data_folder):
-    # TODO
+    train_x = load_lines(os.path.join(data_folder, "train.nl"))
+    train_y = load_lines(os.path.join(data_folder, "train.sql"))
+    dev_x = load_lines(os.path.join(data_folder, "dev.nl"))
+    dev_y = load_lines(os.path.join(data_folder, "dev.sql"))
+    test_x = load_lines(os.path.join(data_folder, "test.nl"))
     return train_x, train_y, dev_x, dev_y, test_x
