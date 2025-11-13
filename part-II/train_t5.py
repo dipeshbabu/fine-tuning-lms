@@ -58,7 +58,7 @@ def get_args():
     )
     parser.add_argument("--num_warmup_epochs", type=int,
                         default=0, help="Warmup epochs if using a scheduler")
-    parser.add_argument("--max_n_epochs", type=int, default=5,
+    parser.add_argument("--max_n_epochs", type=int, default=3,
                         help="How many epochs to train the model for")
     parser.add_argument(
         "--patience_epochs",
