@@ -1,17 +1,14 @@
 import os
 import random
 from typing import List
-
 from nltk.corpus import wordnet
 from nltk import word_tokenize
 from nltk.tokenize.treebank import TreebankWordDetokenizer
 
-# Global seeds / RNG
 random.seed(0)
 _RNG = random.Random(3407)
 
-
-# Lexicons / maps
+# ----- lexicons -----
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "so", "very", "really", "just", "quite", "rather", "some", "any",
     "many", "much", "more", "most", "also", "still", "even", "though", "while", "however", "indeed", "like"
@@ -35,15 +32,34 @@ KEYBOARD_NEIGHBORS = {
     "z": "x", "x": "zc", "c": "xv", "v": "cb", "b": "vn", "n": "bm", "m": "n"
 }
 
-# Defaults (your original numbers). You can override via env vars.
-# Example: SYN_P=0.2 python main.py ...
-SYN_P_DEFAULT = float(os.getenv("SYN_P",   0.15))
-TYPO_P_DEFAULT = float(os.getenv("TYPO_P",  0.10))
-DROP_P_DEFAULT = float(os.getenv("DROP_P",  0.08))
-LOCALE_P_DEFAULT = float(os.getenv("LOCALE_P", 0.20))
-PUNC_P_DEFAULT = float(os.getenv("PUNC_P",  0.10))
+# Unicode look-alikes (Latin → Cyrillic)
+CONFUSABLES = {
+    "a": "а",  # U+0430
+    "e": "е",  # U+0435
+    "o": "о",  # U+043E
+    "p": "р",  # U+0440
+    "c": "с",  # U+0441
+    "y": "у",  # U+0443
+    "x": "х",  # U+0445
+    "A": "А",  # U+0410
+    "E": "Е",  # U+0415
+    "O": "О",  # U+041E
+    "P": "Р",  # U+0420
+    "C": "С",  # U+0421
+    "Y": "У",  # U+0423
+    "X": "Х",  # U+0425
+}
 
-# One-time WordNet availability check
+# ---- defaults (env-overridable) ----
+SYN_P = float(os.getenv("SYN_P",   0.15))
+TYPO_P = float(os.getenv("TYPO_P",  0.10))
+DROP_P = float(os.getenv("DROP_P",  0.08))
+LOCALE_P = float(os.getenv("LOCALE_P", 0.20))
+PUNC_P = float(os.getenv("PUNC_P",  0.10))
+# case jitter prob per eligible token
+CASE_P = float(os.getenv("CASE_P",  0.25))
+# confusable swap prob per eligible char
+CONF_P = float(os.getenv("CONF_P",  0.20))
 
 
 def _maybe_download_wordnet_once() -> None:
@@ -55,42 +71,20 @@ def _maybe_download_wordnet_once() -> None:
             nltk.download("wordnet", quiet=True)
             nltk.download("omw-1.4", quiet=True)
         except Exception:
-            # If offline, synonym step will silently no-op.
             pass
 
 
 _maybe_download_wordnet_once()
 
-# Public helpers
-
 
 def example_transform(example: dict) -> dict:
-    """
-    Baseline example transform: lowercase the text.
-    """
-    text = example.get("text", "")
-    example["text"] = text.lower()
+    example["text"] = example.get("text", "").lower()
     return example
 
 
 def custom_transform(example: dict) -> dict:
-    """
-    Label-preserving OOD transform combining:
-      - synonym replacement via WordNet (guarding sentiment & negations)
-      - US<->UK spelling swaps
-      - realistic typos (neighbor subst / deletion / duplication)
-      - light stopword dropout
-      - punctuation jitter
-    Strengths are controlled by *_DEFAULT constants (or env vars) and
-    are intentionally modest to avoid flipping sentiment labels.
-    """
-    # knobs
-    SYN_P = SYN_P_DEFAULT
-    TYPO_P = TYPO_P_DEFAULT
-    DROP_P = DROP_P_DEFAULT
-    LOCALE_P = LOCALE_P_DEFAULT
-    PUNC_P = PUNC_P_DEFAULT
-
+    """Label-preserving OOD transform with synonym, typo, locale, stopword drop,
+    punctuation jitter + (NEW) case jitter & Unicode confusables."""
     def _preserve_case(orig: str, rep: str) -> str:
         return rep.capitalize() if orig[:1].isupper() else rep
 
@@ -111,28 +105,25 @@ def custom_transform(example: dict) -> dict:
                     lemmas.append(cand)
         if not lemmas:
             return tok
-        rep = _RNG.choice(lemmas)
-        return _preserve_case(tok, rep)
+        return _preserve_case(tok, _RNG.choice(lemmas))
 
     def _typo(tok: str) -> str:
         if len(tok) < 3 or _RNG.random() > TYPO_P:
             return tok
-        choice = _RNG.random()
-        # 60% neighbor substitution, 20% deletion, 20% duplication
-        if choice < 0.6:
-            i = _RNG.randint(1, len(tok) - 2)
+        r = _RNG.random()
+        if r < 0.6:
+            i = _RNG.randint(1, len(tok)-2)
             c = tok[i].lower()
             if c in KEYBOARD_NEIGHBORS:
                 repl = _RNG.choice(list(KEYBOARD_NEIGHBORS[c]))
-                return tok[:i] + repl + tok[i + 1:]
+                return tok[:i] + repl + tok[i+1:]
             return tok
-        elif choice < 0.8:
-            i = _RNG.randint(1, len(tok) - 2)
-            return tok[:i] + tok[i + 1:]
+        elif r < 0.8:
+            i = _RNG.randint(1, len(tok)-2)
+            return tok[:i] + tok[i+1:]
         else:
-            i = _RNG.randint(1, len(tok) - 2)
-            c = tok[i]
-            return tok[:i] + c + tok[i:]
+            i = _RNG.randint(1, len(tok)-2)
+            return tok[:i] + tok[i] + tok[i:]
 
     def _locale_swap(tok: str) -> str:
         low = tok.lower()
@@ -141,7 +132,32 @@ def custom_transform(example: dict) -> dict:
         rep = US_UK_MAP.get(low) or UK_US_MAP.get(low)
         return _preserve_case(tok, rep) if rep else tok
 
-    # Tokenize (fallback to .split if punkt missing)
+    def _case_jitter(tok: str) -> str:
+        # Skip polar/negation and short tokens
+        if tok.lower() in SENTIMENT_POLAR or tok.lower() in NEGATION_GUARDS or len(tok) < 3:
+            return tok
+        if _RNG.random() > CASE_P:
+            return tok
+        chars = list(tok)
+        for i in range(1, len(chars)-1):
+            if chars[i].isalpha() and _RNG.random() < 0.35:
+                chars[i] = chars[i].lower(
+                ) if chars[i].isupper() else chars[i].upper()
+        return "".join(chars)
+
+    def _confusables(tok: str) -> str:
+        # Swap a few letters with Unicode look-alikes (skip polar/negation words)
+        if tok.lower() in SENTIMENT_POLAR or tok.lower() in NEGATION_GUARDS:
+            return tok
+        # Apply per-character with low probability
+        out = []
+        for ch in tok:
+            if ch in CONFUSABLES and _RNG.random() < CONF_P:
+                out.append(CONFUSABLES[ch])
+            else:
+                out.append(ch)
+        return "".join(out)
+
     text = example.get("text", "")
     try:
         toks = word_tokenize(text)
@@ -153,27 +169,22 @@ def custom_transform(example: dict) -> dict:
             pass
         toks = text.split()
 
-    # Apply transforms token-wise
     new_toks: List[str] = []
     for t in toks:
         low = t.lower()
-        # dropout only harmless function words (not negations / sentiment)
         if low in STOPWORDS and low not in NEGATION_GUARDS and low not in SENTIMENT_POLAR:
             if _RNG.random() < DROP_P:
                 continue
         t1 = _synonym(t)
         t2 = _locale_swap(t1)
         t3 = _typo(t2)
-        new_toks.append(t3)
+        t4 = _case_jitter(t3)
+        t5 = _confusables(t4)
+        new_toks.append(t5)
 
-    # Detokenize + punctuation jitter
-    if new_toks:
-        detok = TreebankWordDetokenizer().detokenize(new_toks)
-    else:
-        detok = ""  # if everything dropped (rare), keep empty string
+    detok = TreebankWordDetokenizer().detokenize(new_toks) if new_toks else ""
     if _RNG.random() < PUNC_P:
         detok = detok.replace("...", " … ").replace(
             "!", ".").replace(".", "…", 1)
-
     example["text"] = detok
     return example
