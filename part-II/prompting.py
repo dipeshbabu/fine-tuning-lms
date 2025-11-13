@@ -1,4 +1,6 @@
-import os, argparse, random
+import os
+import argparse
+import random
 from tqdm import tqdm
 
 import torch
@@ -10,7 +12,10 @@ from utils import set_random_seeds, compute_metrics, save_queries_and_records, c
 from prompting_utils import read_schema, extract_sql_query, save_logs
 from load_data import load_prompting_data
 
-DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') # you can add mps
+DEVICE = torch.device('cuda') if torch.cuda.is_available(
+) else torch.device('cpu')  # you can add mps
+
+FEW_SHOT_EXAMPLES = []  # will be populated in main()
 
 
 def get_args():
@@ -37,7 +42,7 @@ def get_args():
     return args
 
 
-def create_prompt(sentence, k):
+def create_prompt(sentence, k, schema_txt=None):
     '''
     Function for creating a prompt for zero or few-shot prompting.
 
@@ -46,8 +51,25 @@ def create_prompt(sentence, k):
     Inputs:
         * sentence (str): A text string
         * k (int): Number of examples in k-shot prompting
+        * schema_txt (str, optional): The database schema text
     '''
-    # TODO
+    parts = []
+    if schema_txt:
+        parts.append(
+            "You are a helpful assistant that writes correct SQL for the given flight database.\n")
+        parts.append("Database schema:\n")
+        parts.append(schema_txt.strip()[:4000])  # cap context
+        parts.append("\n---\n")
+
+    if k > 0 and FEW_SHOT_EXAMPLES:
+        k = min(k, len(FEW_SHOT_EXAMPLES))
+        parts.append(f"Examples ({k}):\n")
+        for demo_nl, demo_sql in FEW_SHOT_EXAMPLES[:k]:
+            parts.append(f"NL: {demo_nl}\nSQL:\n{demo_sql}\n")
+        parts.append("\n---\n")
+
+    parts.append(f"NL: {sentence}\nSQL:")
+    return "\n".join(parts)
 
 
 def exp_kshot(tokenizer, model, inputs, k):
@@ -67,11 +89,14 @@ def exp_kshot(tokenizer, model, inputs, k):
     extracted_queries = []
 
     for i, sentence in tqdm(enumerate(inputs)):
-        prompt = create_prompt(sentence, k) # Looking at the prompt may also help
+        # Looking at the prompt may also help
+        prompt = create_prompt(sentence, k)
 
         input_ids = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-        outputs = model.generate(**input_ids, max_new_tokens=MAX_NEW_TOKENS) # You should set MAX_NEW_TOKENS
-        response = tokenizer.decode(outputs[0]) # How does the response look like? You may need to parse it
+        # You should set MAX_NEW_TOKENS
+        outputs = model.generate(**input_ids, max_new_tokens=MAX_NEW_TOKENS)
+        # How does the response look like? You may need to parse it
+        response = tokenizer.decode(outputs[0])
         raw_outputs.append(response)
 
         # Extract the SQL query
@@ -80,13 +105,24 @@ def exp_kshot(tokenizer, model, inputs, k):
     return raw_outputs, extracted_queries
 
 
-def eval_outputs(eval_x, eval_y, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
-    '''
-    Evaluate the outputs of the model by computing the metrics.
+def eval_outputs(eval_x, eval_y, gt_path, model_path, gt_query_records, model_query_records):
+    """
+    Write predicted SQL to file, compute records, and return metrics and error rate.
+    """
+    # save queries and records (this will also compute records)
+    # Make sure folder exists
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    os.makedirs(os.path.dirname(model_query_records), exist_ok=True)
 
-    Add/modify the arguments and code as needed.
-    '''
-    # TODO
+    # model_path already written by caller if desired; we directly save here:
+    # (safe to overwrite)
+    # Note: we assume caller passes a list of strings in eval_y for ground-truth (dev only)
+    # but compute_metrics reads GT from files.
+    sql_em, record_em, record_f1, model_error_msgs = compute_metrics(
+        gt_path, model_path, gt_query_records, model_query_records
+    )
+    error_rate = sum(1 for e in (model_error_msgs or []) if e) / \
+        max(1, len(model_error_msgs or []))
     return sql_em, record_em, record_f1, model_error_msgs, error_rate
 
 
@@ -95,7 +131,7 @@ def initialize_model_and_tokenizer(model_name, to_quantize=False):
     Args:
         * model_name (str): Model name ("gemma" or "codegemma").
         * to_quantize (bool): Use a quantized version of the model (e.g. 4bits)
-    
+
     To access to the model on HuggingFace, you need to log in and review the 
     conditions and access the model's content.
     '''
@@ -105,7 +141,7 @@ def initialize_model_and_tokenizer(model_name, to_quantize=False):
         # Native weights exported in bfloat16 precision, but you can use a different precision if needed
         model = GemmaForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
         ).to(DEVICE)
     elif model_name == "codegemma":
         model_id = "google/codegemma-7b-it"
@@ -113,14 +149,16 @@ def initialize_model_and_tokenizer(model_name, to_quantize=False):
         if to_quantize:
             nf4_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_quant_type="nf4", # 4-bit quantization
+                bnb_4bit_quant_type="nf4",  # 4-bit quantization
             )
             model = AutoModelForCausalLM.from_pretrained(model_id,
-                                                        torch_dtype=torch.bfloat16,
-                                                        config=nf4_config).to(DEVICE)
+                                                         torch_dtype=torch.bfloat16,
+                                                         config=nf4_config).to(DEVICE)
         else:
             model = AutoModelForCausalLM.from_pretrained(model_id,
-                                                        torch_dtype=torch.bfloat16).to(DEVICE)
+                                                         torch_dtype=torch.bfloat16).to(DEVICE)
+    else:
+        raise ValueError("Unsupported model name")
     return tokenizer, model
 
 
@@ -130,51 +168,75 @@ def main():
     are not required to use this pipeline.
     You can design your own pipeline, and you can also modify the code below.
     '''
-    args = get_args()
-    shot = args.shot
-    ptype = args.ptype
-    model_name = args.model
-    to_quantize = args.quantization
-    experiment_name = args.experiment_name
+    global FEW_SHOT_EXAMPLES
 
+    args = get_args()
     set_random_seeds(args.seed)
 
     data_folder = 'data'
     train_x, train_y, dev_x, dev_y, test_x = load_prompting_data(data_folder)
+    FEW_SHOT_EXAMPLES = list(zip(train_x, train_y))
+
+    schema_txt = read_schema(os.path.join(
+        data_folder, "flight_database.schema"))
 
     # Model and tokenizer
-    tokenizer, model = initialize_model_and_tokenizer(model_name, to_quantize)
+    tokenizer, model = initialize_model_and_tokenizer(
+        args.model, args.quantization)
 
     for eval_split in ["dev", "test"]:
-        eval_x, eval_y = (dev_x, dev_y) if eval_split == "dev" else (test_x, None)
+        eval_x = dev_x if eval_split == "dev" else test_x
 
-        raw_outputs, extracted_queries = exp_kshot(tokenizer, model, eval_x, k)
+        # Generate SQL
+        raw_outputs, extracted_queries = exp_kshot(
+            tokenizer, model, eval_x, args.shot, schema_txt)
 
-        # You can add any post-processing if needed
-        # You can compute the records with `compute_records``
+        # Save predictions and records
+        os.makedirs("results", exist_ok=True)
+        os.makedirs("records", exist_ok=True)
+        tag = f"{args.model}_{args.experiment_name}_{eval_split}"
+        model_sql_path = os.path.join(
+            "results", f"gemma_{args.experiment_name}_{eval_split}.sql")
+        model_record_path = os.path.join(
+            "records", f"gemma_{args.experiment_name}_{eval_split}.pkl")
 
-        gt_query_records = f"records/{eval_split}_gt_records.pkl"
-        gt_sql_path = os.path.join(f'data/{eval_split}.sql')
-        gt_record_path = os.path.join(f'records/{eval_split}_gt_records.pkl')
-        model_sql_path = os.path.join(f'results/gemma_{experiment_name}_dev.sql')
-        model_record_path = os.path.join(f'records/gemma_{experiment_name}_dev.pkl')
-        sql_em, record_em, record_f1, model_error_msgs, error_rate = eval_outputs(
-            eval_x, eval_y,
-            gt_path=gt_sql_path,
-            model_path=model_sql_path,
-            gt_query_records=gt_query_records,
-            model_query_records=model_record_path
-        )
-        print(f"{eval_split} set results: ")
-        print(f"Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
-        print(f"{eval_split} set results: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
+        # write queries file
+        with open(model_sql_path, "w", encoding="utf-8") as f:
+            for q in extracted_queries:
+                f.write(q.strip() + "\n")
 
-        # Save results
-        # You can for instance use the `save_queries_and_records` function
+        # compute and save records for these queries
+        from utils import compute_records
+        recs, errs = compute_records(extracted_queries)
+        import pickle
+        with open(model_record_path, "wb") as pf:
+            pickle.dump((recs, errs), pf)
 
-        # Save logs, if needed
-        log_path = "" # to specify
-        save_logs(log_path, sql_em, record_em, record_f1, model_error_msgs)
+        gt_sql_path = os.path.join(
+            'data', f'{eval_split}.sql') if eval_split == "dev" else os.path.join('data', 'test.sql')
+        gt_record_path = os.path.join('records', f'{eval_split}_gt_records.pkl') if eval_split == "dev" else os.path.join(
+            'records', 'test_gt_records.pkl')
+        # For test, leaderboard uses held-out; keep formats identical. If you don't have GT records for test locally,
+        # you can still print metrics for dev and skip for test.
+        if eval_split == "dev" and os.path.exists(gt_sql_path) and os.path.exists(gt_record_path):
+            sql_em, record_em, record_f1, model_error_msgs, error_rate = eval_outputs(
+                eval_x, dev_y,
+                gt_path=gt_sql_path,
+                model_path=model_sql_path,
+                gt_query_records=gt_record_path,
+                model_query_records=model_record_path
+            )
+            print(
+                f"{eval_split} set results: Record F1: {record_f1:.4f}, Record EM: {record_em:.4f}, SQL EM: {sql_em:.4f}")
+            print(
+                f"{eval_split} set: {error_rate*100:.2f}% of generations caused SQL errors")
+            # Save logs
+            os.makedirs("logs", exist_ok=True)
+            save_logs(os.path.join(
+                "logs", f"{tag}.log"), sql_em, record_em, record_f1, model_error_msgs)
+        else:
+            print(
+                f"{eval_split} predictions saved to {model_sql_path} / {model_record_path}")
 
 
 if __name__ == "__main__":
