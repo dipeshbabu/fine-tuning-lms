@@ -15,8 +15,6 @@ from load_data import load_prompting_data
 DEVICE = torch.device('cuda') if torch.cuda.is_available(
 ) else torch.device('cpu')  # you can add mps
 
-FEW_SHOT_EXAMPLES = []  # will be populated in main()
-
 
 def get_args():
     '''
@@ -42,7 +40,7 @@ def get_args():
     return args
 
 
-def create_prompt(sentence, k, schema_txt=None):
+def create_prompt(sentence, k):
     '''
     Function for creating a prompt for zero or few-shot prompting.
 
@@ -51,25 +49,26 @@ def create_prompt(sentence, k, schema_txt=None):
     Inputs:
         * sentence (str): A text string
         * k (int): Number of examples in k-shot prompting
-        * schema_txt (str, optional): The database schema text
     '''
-    parts = []
-    if schema_txt:
-        parts.append(
-            "You are a helpful assistant that writes correct SQL for the given flight database.\n")
-        parts.append("Database schema:\n")
-        parts.append(schema_txt.strip()[:4000])  # cap context
-        parts.append("\n---\n")
+    # TODO
+    # Also ensure MAX_NEW_TOKENS exists (exp_kshot relies on it).
+    global MAX_NEW_TOKENS
+    if "MAX_NEW_TOKENS" not in globals():
+        MAX_NEW_TOKENS = 128
 
-    if k > 0 and FEW_SHOT_EXAMPLES:
-        k = min(k, len(FEW_SHOT_EXAMPLES))
-        parts.append(f"Examples ({k}):\n")
-        for demo_nl, demo_sql in FEW_SHOT_EXAMPLES[:k]:
-            parts.append(f"NL: {demo_nl}\nSQL:\n{demo_sql}\n")
-        parts.append("\n---\n")
+    header = (
+        "You are a helpful assistant that translates natural language into SQL for a fixed SQLite schema.\n"
+        "Return only a single valid SQL query terminated with a semicolon.\n"
+    )
+    # Simple zero/few-shot format (few-shot placeholders; in practice you'd sample k examples)
+    fewshot = ""
+    if k and k > 0:
+        fewshot = (
+            "NL: how many flights depart from JFK?\n"
+            "SQL: SELECT COUNT(*) FROM flights WHERE origin = 'JFK';\n\n"
+        )
 
-    parts.append(f"NL: {sentence}\nSQL:")
-    return "\n".join(parts)
+    return f"{header}{fewshot}NL: {sentence}\nSQL:"
 
 
 def exp_kshot(tokenizer, model, inputs, k):
@@ -106,23 +105,32 @@ def exp_kshot(tokenizer, model, inputs, k):
 
 
 def eval_outputs(eval_x, eval_y, gt_path, model_path, gt_query_records, model_query_records):
-    """
-    Write predicted SQL to file, compute records, and return metrics and error rate.
-    """
-    # save queries and records (this will also compute records)
-    # Make sure folder exists
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    os.makedirs(os.path.dirname(model_query_records), exist_ok=True)
+    '''
+    Evaluate the outputs of the model by computing the metrics.
 
-    # model_path already written by caller if desired; we directly save here:
-    # (safe to overwrite)
-    # Note: we assume caller passes a list of strings in eval_y for ground-truth (dev only)
-    # but compute_metrics reads GT from files.
+    Add/modify the arguments and code as needed.
+    '''
+    # TODO
+    # eval_y may be None for test; when present, it’s a list of GT SQL
+    # Save queries file and records, then compute metrics (if GT supplied)
+    # If eval_y is provided, write it to gt_path (useful for standalone runs)
+    if eval_y is not None and not os.path.exists(gt_path):
+        with open(gt_path, "w", encoding="utf-8") as f:
+            for q in eval_y:
+                f.write(q.strip() + "\n")
+
+    # model_path/model_query_records should already be saved by caller, but be robust:
+    if not os.path.exists(model_path) or not os.path.exists(model_query_records):
+        # If the caller hasn’t saved, we can’t compute; return zeros.
+        return 0.0, 0.0, 0.0, [], 1.0
+
     sql_em, record_em, record_f1, model_error_msgs = compute_metrics(
         gt_path, model_path, gt_query_records, model_query_records
     )
-    error_rate = sum(1 for e in (model_error_msgs or []) if e) / \
+    error_rate = (
+        sum(1 for e in (model_error_msgs or []) if e) /
         max(1, len(model_error_msgs or []))
+    )
     return sql_em, record_em, record_f1, model_error_msgs, error_rate
 
 
@@ -157,8 +165,6 @@ def initialize_model_and_tokenizer(model_name, to_quantize=False):
         else:
             model = AutoModelForCausalLM.from_pretrained(model_id,
                                                          torch_dtype=torch.bfloat16).to(DEVICE)
-    else:
-        raise ValueError("Unsupported model name")
     return tokenizer, model
 
 
@@ -168,75 +174,58 @@ def main():
     are not required to use this pipeline.
     You can design your own pipeline, and you can also modify the code below.
     '''
-    global FEW_SHOT_EXAMPLES
-
     args = get_args()
+    shot = args.shot
+    ptype = args.ptype
+    model_name = args.model
+    to_quantize = args.quantization
+    experiment_name = args.experiment_name
+
     set_random_seeds(args.seed)
 
     data_folder = 'data'
     train_x, train_y, dev_x, dev_y, test_x = load_prompting_data(data_folder)
-    FEW_SHOT_EXAMPLES = list(zip(train_x, train_y))
-
-    schema_txt = read_schema(os.path.join(
-        data_folder, "flight_database.schema"))
 
     # Model and tokenizer
-    tokenizer, model = initialize_model_and_tokenizer(
-        args.model, args.quantization)
+    tokenizer, model = initialize_model_and_tokenizer(model_name, to_quantize)
 
     for eval_split in ["dev", "test"]:
-        eval_x = dev_x if eval_split == "dev" else test_x
+        eval_x, eval_y = (
+            dev_x, dev_y) if eval_split == "dev" else (test_x, None)
 
-        # Generate SQL
         raw_outputs, extracted_queries = exp_kshot(
-            tokenizer, model, eval_x, args.shot, schema_txt)
+            tokenizer, model, eval_x, shot)
 
         # Save predictions and records
         os.makedirs("results", exist_ok=True)
         os.makedirs("records", exist_ok=True)
-        tag = f"{args.model}_{args.experiment_name}_{eval_split}"
         model_sql_path = os.path.join(
-            "results", f"gemma_{args.experiment_name}_{eval_split}.sql")
+            f'results/gemma_{experiment_name}_{eval_split}.sql')
         model_record_path = os.path.join(
-            "records", f"gemma_{args.experiment_name}_{eval_split}.pkl")
+            f'records/gemma_{experiment_name}_{eval_split}.pkl')
+        save_queries_and_records(
+            extracted_queries, model_sql_path, model_record_path)
 
-        # write queries file
-        with open(model_sql_path, "w", encoding="utf-8") as f:
-            for q in extracted_queries:
-                f.write(q.strip() + "\n")
+        gt_query_records = f"records/{eval_split}_gt_records.pkl"
+        gt_sql_path = os.path.join(f'data/{eval_split}.sql')
+        gt_record_path = os.path.join(f'records/{eval_split}_gt_records.pkl')
 
-        # compute and save records for these queries
-        from utils import compute_records
-        recs, errs = compute_records(extracted_queries)
-        import pickle
-        with open(model_record_path, "wb") as pf:
-            pickle.dump((recs, errs), pf)
+        sql_em, record_em, record_f1, model_error_msgs, error_rate = eval_outputs(
+            eval_x, eval_y,
+            gt_path=gt_sql_path,
+            model_path=model_sql_path,
+            gt_query_records=gt_query_records,
+            model_query_records=model_record_path
+        )
+        print(f"{eval_split} set results: ")
+        print(
+            f"Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
+        print(f"{eval_split} set results: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
-        gt_sql_path = os.path.join(
-            'data', f'{eval_split}.sql') if eval_split == "dev" else os.path.join('data', 'test.sql')
-        gt_record_path = os.path.join('records', f'{eval_split}_gt_records.pkl') if eval_split == "dev" else os.path.join(
-            'records', 'test_gt_records.pkl')
-        # For test, leaderboard uses held-out; keep formats identical. If you don't have GT records for test locally,
-        # you can still print metrics for dev and skip for test.
-        if eval_split == "dev" and os.path.exists(gt_sql_path) and os.path.exists(gt_record_path):
-            sql_em, record_em, record_f1, model_error_msgs, error_rate = eval_outputs(
-                eval_x, dev_y,
-                gt_path=gt_sql_path,
-                model_path=model_sql_path,
-                gt_query_records=gt_record_path,
-                model_query_records=model_record_path
-            )
-            print(
-                f"{eval_split} set results: Record F1: {record_f1:.4f}, Record EM: {record_em:.4f}, SQL EM: {sql_em:.4f}")
-            print(
-                f"{eval_split} set: {error_rate*100:.2f}% of generations caused SQL errors")
-            # Save logs
-            os.makedirs("logs", exist_ok=True)
-            save_logs(os.path.join(
-                "logs", f"{tag}.log"), sql_em, record_em, record_f1, model_error_msgs)
-        else:
-            print(
-                f"{eval_split} predictions saved to {model_sql_path} / {model_record_path}")
+        # Save logs
+        log_path = os.path.join(
+            "results", f"gemma_{experiment_name}_{eval_split}.log")
+        save_logs(log_path, sql_em, record_em, record_f1, model_error_msgs)
 
 
 if __name__ == "__main__":

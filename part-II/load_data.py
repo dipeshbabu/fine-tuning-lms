@@ -1,6 +1,12 @@
 import torch
 from transformers import T5TokenizerFast
 import os
+import random
+import re
+import string
+from collections import Counter
+from tqdm import tqdm
+import pickle
 
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
@@ -9,8 +15,11 @@ import nltk
 nltk.download('punkt')
 
 PAD_IDX = 0
-DEVICE = torch.device(
-    'cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+# resolve data folder relative to this file
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(SCRIPT_DIR, "data")\
+
 
 
 def _shift_right(labels, pad_token_id: int):
@@ -21,10 +30,9 @@ def _shift_right(labels, pad_token_id: int):
     return shifted
 
 
-def load_lines(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f.readlines()]
-    return lines
+def _load_lines(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f.readlines()]
 
 
 class T5Dataset(Dataset):
@@ -40,38 +48,39 @@ class T5Dataset(Dataset):
               T5Tokenizer should serve that purpose.
             * Class behavior should be different on the test set.
         '''
+        # TODO
         self.data_folder = data_folder
         self.split = split
         self.tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
-        # T5 uses pad token id = 0; also serves as decoder_start_token_id
-        self.pad_id = self.tokenizer.pad_token_id
-
+        self.pad_id = self.tokenizer.pad_token_id  # 0 for T5
         self.items = self.process_data(data_folder, split, self.tokenizer)
 
     def process_data(self, data_folder, split, tokenizer):
+        # TODO
         nl_path = os.path.join(data_folder, f"{split}.nl")
-        nl = load_lines(nl_path)
+        nl = _load_lines(nl_path)
 
         items = []
         if split == "test":
-            # no SQL for test
             for x in nl:
                 items.append({"nl": x, "sql": None})
         else:
             sql_path = os.path.join(data_folder, f"{split}.sql")
-            sql = load_lines(sql_path)
+            sql = _load_lines(sql_path)
             assert len(nl) == len(sql), f"NL/SQL size mismatch for {split}"
             for x, y in zip(nl, sql):
                 items.append({"nl": x, "sql": y})
         return items
 
     def __len__(self):
+        # TODO
         return len(self.items)
 
     def __getitem__(self, idx):
+        # TODO
         ex = self.items[idx]
         nl = ex["nl"]
-        # (Optional) small task prefix helps T5 a bit
+        # Small task prefix helps T5 a bit
         nl_in = f"translate to SQL: {nl}"
 
         enc = self.tokenizer(nl_in, truncation=True,
@@ -80,25 +89,20 @@ class T5Dataset(Dataset):
 
         if self.split == "test":
             # For test we only return encoder inputs
-            return {
-                "encoder_ids": enc_ids,
-            }
+            return {"encoder_ids": enc_ids}
 
         sql = ex["sql"]
         dec = self.tokenizer(sql, truncation=True,
                              max_length=256, return_tensors=None)
         dec_ids = torch.tensor(dec["input_ids"], dtype=torch.long)
 
-        # Targets (labels). We keep pad tokens = 0; loss will mask them later in loop
         labels = dec_ids
-
-        # first decoder token to feed when generating (T5 uses pad token id to start)
         initial_dec_inp = torch.tensor([self.pad_id], dtype=torch.long)
 
         return {
             "encoder_ids": enc_ids,
             "decoder_labels": labels,
-            "initial_decoder_input": initial_dec_inp
+            "initial_decoder_input": initial_dec_inp,
         }
 
 
@@ -118,21 +122,22 @@ def normal_collate_fn(batch):
         * decoder_targets: The target tokens with which to train the decoder (the tokens following each decoder input)
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
+    # TODO
     encs = [b["encoder_ids"] for b in batch]
     dec_tgts = [b["decoder_labels"] for b in batch]
     init_inputs = [b["initial_decoder_input"] for b in batch]
 
     enc_padded = pad_sequence(encs, batch_first=True, padding_value=PAD_IDX)
-    enc_mask = (enc_padded != PAD_IDX).long()
+    encoder_mask = (enc_padded != PAD_IDX).long()
 
     tgt_padded = pad_sequence(
         dec_tgts, batch_first=True, padding_value=PAD_IDX)
-    # Shift-right to get decoder inputs
     dec_inputs = _shift_right(tgt_padded, pad_token_id=PAD_IDX)
+
     init_padded = pad_sequence(
         init_inputs, batch_first=True, padding_value=PAD_IDX)
 
-    return enc_padded, enc_mask, dec_inputs, tgt_padded, init_padded
+    return enc_padded, encoder_mask, dec_inputs, tgt_padded, init_padded
 
 
 def test_collate_fn(batch):
@@ -148,16 +153,16 @@ def test_collate_fn(batch):
         * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
+    # TODO
     encs = [b["encoder_ids"] for b in batch]
     enc_padded = pad_sequence(encs, batch_first=True, padding_value=PAD_IDX)
-    enc_mask = (enc_padded != PAD_IDX).long()
-    # T5 starts decoder with pad token id
+    encoder_mask = (enc_padded != PAD_IDX).long()
     initial_dec = torch.full((len(batch), 1), PAD_IDX, dtype=torch.long)
-    return enc_padded, enc_mask, initial_dec
+    return enc_padded, encoder_mask, initial_dec
 
 
 def get_dataloader(batch_size, split):
-    data_folder = 'data'
+    data_folder = DATA_ROOT
     dset = T5Dataset(data_folder, split)
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
@@ -182,6 +187,7 @@ def load_lines(path):
 
 
 def load_prompting_data(data_folder):
+    # TODO
     train_x = load_lines(os.path.join(data_folder, "train.nl"))
     train_y = load_lines(os.path.join(data_folder, "train.sql"))
     dev_x = load_lines(os.path.join(data_folder, "dev.nl"))

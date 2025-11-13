@@ -11,7 +11,9 @@ from typing import List, Any
 
 import torch
 
-DB_PATH = 'data/flight_database.db'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, "data", "flight_database.db")
+
 
 def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None, model_query_records: str = None):
     '''
@@ -29,13 +31,15 @@ def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None,
                                      returned by the model-generated SQL queries.
     '''
     gt_qs, gt_records, _ = load_queries_and_records(gt_path, gt_query_records)
-    model_qs, model_records, model_error_msgs = load_queries_and_records(model_path, model_query_records)
+    model_qs, model_records, model_error_msgs = load_queries_and_records(
+        model_path, model_query_records)
 
     sql_em = compute_sql_exact_match(gt_qs, model_qs)
     record_em = compute_record_exact_match(gt_records, model_records)
     record_f1 = compute_record_F1(gt_records, model_records)
 
     return sql_em, record_em, record_f1, model_error_msgs
+
 
 def load_queries_and_records(sql_path: str, record_path: str):
     '''
@@ -57,6 +61,7 @@ def load_queries_and_records(sql_path: str, record_path: str):
 
     return read_qs, records, error_msgs
 
+
 def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path: str):
     '''
     Helper function to save model generated SQL queries and their associated records
@@ -73,14 +78,16 @@ def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path:
             f.write(f'{query}\n')
 
     # Next compute and save records
-    records, error_msgs = compute_records(sql_queries)    
+    records, error_msgs = compute_records(sql_queries)
     with open(record_path, 'wb') as f:
         pickle.dump((records, error_msgs), f)
+
 
 def read_queries(sql_path: str):
     with open(sql_path, 'r') as f:
         qs = [q.strip() for q in f.readlines()]
     return qs
+
 
 def compute_records(processed_qs: List[str]):
     '''
@@ -98,7 +105,7 @@ def compute_records(processed_qs: List[str]):
     futures = []
     for i, query in enumerate(processed_qs):
         futures.append(pool.submit(compute_record, i, query))
-        
+
     rec_dict = {}
     try:
         for x in tqdm(as_completed(futures, timeout=timeout_secs)):
@@ -108,7 +115,7 @@ def compute_records(processed_qs: List[str]):
         for future in futures:
             if not future.done():
                 future.cancel()
-            
+
     recs = []
     error_msgs = []
     for i in range(len(processed_qs)):
@@ -119,8 +126,9 @@ def compute_records(processed_qs: List[str]):
         else:
             recs.append([])
             error_msgs.append("Query timed out")
-            
+
     return recs, error_msgs
+
 
 def compute_record(query_id, query):
     conn = sqlite3.connect(DB_PATH)
@@ -137,6 +145,7 @@ def compute_record(query_id, query):
     conn.close()
     return query_id, rec, error_msg
 
+
 def compute_sql_exact_match(gt_qs: List[str], model_qs: List[str]):
     '''
     Helper function to compute exact match between ground-truth
@@ -148,6 +157,7 @@ def compute_sql_exact_match(gt_qs: List[str], model_qs: List[str]):
         total += 1
         ems += 1 if gt_q == model_q else 0
     return ems / total
+
 
 def compute_record_exact_match(gt_records: List[Any], model_records: List[Any]):
     '''
@@ -161,6 +171,7 @@ def compute_record_exact_match(gt_records: List[Any], model_records: List[Any]):
         ems += 1 if set(gt_rec) == set(model_rec) else 0
     return ems / total
 
+
 def compute_record_F1(gt_records: List[Any], model_records: List[Any]):
     '''
     Helper function to compute F1 between records
@@ -169,24 +180,27 @@ def compute_record_F1(gt_records: List[Any], model_records: List[Any]):
     F1s = []
     for gt_rec, model_rec in zip(gt_records, model_records):
         gt_set = set(gt_rec)
-        model_set = set(model_rec)        
+        model_set = set(model_rec)
 
         precision_total = len(model_set)
         if precision_total == 0:
             precision = 1
         else:
-            precision = len([rec for rec in model_set if rec in gt_set]) / precision_total
-    
-        recall_total = len(gt_set)    
+            precision = len(
+                [rec for rec in model_set if rec in gt_set]) / precision_total
+
+        recall_total = len(gt_set)
         if recall_total == 0:
             recall = 1
         else:
-            recall = len([rec for rec in gt_set if rec in model_set]) / recall_total
+            recall = len(
+                [rec for rec in gt_set if rec in model_set]) / recall_total
 
         F1 = 2 * precision * recall / (precision + recall + 1e-8)
         F1s.append(F1)
 
     return np.mean(F1s)
+
 
 def set_random_seeds(seed_value=42):
     '''
@@ -194,7 +208,7 @@ def set_random_seeds(seed_value=42):
     '''
     random.seed(seed_value)
     np.random.seed(seed_value)
-    
+
     torch.manual_seed(seed_value)
     torch.cuda.manual_seed(seed_value)
     torch.cuda.manual_seed_all(seed_value)
