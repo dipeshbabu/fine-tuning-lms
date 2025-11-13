@@ -102,9 +102,9 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
 
     model_sql_path = os.path.join(
-        RESULTS_DIR, f"t5_{model_type}_{experiment_name}_dev.sql")
+        RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
     model_record_path = os.path.join(
-        RECORDS_DIR, f"t5_{model_type}_{experiment_name}_dev.pkl")
+        RECORDS_DIR, f"t5_{model_type}_{experiment_name}.pkl")
     os.makedirs(os.path.dirname(model_sql_path), exist_ok=True)
     os.makedirs(os.path.dirname(model_record_path), exist_ok=True)
 
@@ -314,9 +314,9 @@ def main():
     gt_sql_path = os.path.join(DATA_DIR, "dev.sql")
     gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
     model_sql_path = os.path.join(
-        RESULTS_DIR, f"t5_{model_type}_{experiment_name}_dev.sql")
+        RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
     model_record_path = os.path.join(
-        RECORDS_DIR, f"t5_{model_type}_{experiment_name}_dev.pkl")
+        RECORDS_DIR, f"t5_{model_type}_{experiment_name}.pkl")
 
     dev_loss, dev_record_f1, dev_record_em, dev_sql_em, dev_error_rate = eval_epoch(
         args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path
