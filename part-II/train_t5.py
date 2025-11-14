@@ -71,7 +71,7 @@ def get_args():
 
     # Generation hyperparameters (used in eval/test)
     parser.add_argument("--gen_max_new_tokens", type=int, default=64)
-    parser.add_argument("--gen_beam_size", type=int, default=4)
+    parser.add_argument("--gen_beam_size", type=int, default=1)
 
     args = parser.parse_args()
     return args
