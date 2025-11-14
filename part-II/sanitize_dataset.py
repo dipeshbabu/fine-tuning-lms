@@ -1,16 +1,16 @@
 import os
 import re
 import time
+import argparse
 from typing import List, Tuple
 
-# --- Config ---
-STRICT_MODE = True  # set False to keep erroring queries but log them
+# ---------- Defaults / Paths ----------
+STRICT_MODE_DEFAULT = True  # can override via --strict / --no-strict
 
-# --- Paths ---
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR    = os.path.join(SCRIPT_DIR, "data")
 RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
-DB_PATH     = os.path.join(DATA_DIR, "flight_database.db")  # utils uses this default too
+DB_PATH     = os.path.join(DATA_DIR, "flight_database.db")  # used by utils.compute_records
 
 # ---------- IO helpers ----------
 def _read_lines(p: str) -> List[str]:
@@ -44,7 +44,7 @@ def _normalize_sql(sql: str) -> str:
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1].strip()
 
-    # Fix fused "selectdistinct" if it happens
+    # Fix fused "selectdistinct" and normalize "select distinct"
     s = re.sub(r"^\s*select\s*distinct", "SELECT DISTINCT", s, flags=re.IGNORECASE)
 
     # Collapse whitespace runs
@@ -59,12 +59,11 @@ def _normalize_sql(sql: str) -> str:
     if not s.endswith(";"):
         s = s + ";"
 
-    # Normalize leading SELECT tokens
+    # Normalize leading SELECT tokens casing
     if s.lower().startswith("select distinct"):
         s = "SELECT DISTINCT" + s[len("select distinct"):]
     elif s.lower().startswith("select"):
         s = "SELECT" + s[len("select"):]
-
     return s.strip()
 
 def _sanitize_pairs(nl: List[str], sql: List[str]) -> Tuple[List[str], List[str], dict]:
@@ -92,62 +91,95 @@ def _sanitize_pairs(nl: List[str], sql: List[str]) -> Tuple[List[str], List[str]
     }
     return keep_nl, keep_sql, stats
 
-# ---------- DB validation ----------
-def _validate_against_db(sql_list: List[str]) -> List[str]:
+# ---------- Parallel DB validation (via utils.compute_records) ----------
+def _validate_via_utils(sql_list: List[str], threads: int, pq_timeout: float, tot_timeout: float) -> list:
     """
-    Execute each SQL against the SQLite DB and return error message list ("" means success).
-    Uses the same logic as utils.compute_records to ensure consistency.
+    Run SQLs through utils.compute_records (parallel, per-query timeouts).
+    Returns the list of error messages ("" on success).
     """
-    import sqlite3
-    errors = []
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    for q in sql_list:
-        try:
-            cur.execute(q)
-            _ = cur.fetchall()
-            errors.append("")
-        except Exception as e:
-            errors.append(f"{type(e).__name__}: {e}")
-    conn.close()
-    return errors
+    # Set env knobs for utils.compute_records
+    os.environ["EVAL_THREADS"] = str(threads)
+    os.environ["PER_QUERY_TIMEOUT_SECS"] = str(pq_timeout)
+    os.environ["EVAL_TOTAL_TIMEOUT_SECS"] = str(tot_timeout)
+    # Optional: allow many failures without early break in sanitize
+    os.environ["MAX_ERROR_FRACTION"] = "1.0"
 
-def _apply_db_validation(nl: List[str], sql: List[str], split: str) -> Tuple[List[str], List[str], dict]:
+    from utils import compute_records
+    _, errs = compute_records(sql_list)
+    return errs
+
+def _apply_db_validation(
+    nl: List[str],
+    sql: List[str],
+    split: str,
+    strict_mode: bool,
+    validate_mode: str,
+    threads: int,
+    pq_timeout: float,
+    tot_timeout: float,
+    sample_k: int | None = None,
+) -> Tuple[List[str], List[str], dict]:
     """
-    Run SQLs; drop pairs with DB errors if STRICT_MODE=True, otherwise keep and report.
+    Validate SQLs on DB depending on validate_mode.
+      - "none": skip DB validation
+      - "all": validate full split
+      - "dev-only": only validate if split=="dev"
+      - "sample": validate a head subset (first K queries)
+    Returns possibly filtered (nl, sql) and stats.
     """
-    errs = _validate_against_db(sql)
-    bad_idx = [i for i, e in enumerate(errs) if e]
+    if validate_mode == "none":
+        return nl, sql, {"db_validation": "skipped", "kept": len(sql), "dropped_db_error": 0}
 
-    if not bad_idx:
-        return nl, sql, {"db_bad": 0, "kept": len(sql), "dropped_db_error": 0}
+    if validate_mode == "dev-only" and split != "dev":
+        return nl, sql, {"db_validation": "skipped_non_dev", "kept": len(sql), "dropped_db_error": 0}
 
-    print(f"[WARN] {split}: {len(bad_idx)} / {len(sql)} queries raise DB errors.")
-    for i in bad_idx[:10]:
-        print(f"  [ERR] idx={i} -> {errs[i]}")
-    if len(bad_idx) > 10:
-        print(f"  ... {len(bad_idx)-10} more")
+    to_validate_idx = list(range(len(sql)))
+    if validate_mode == "sample":
+        k = min(sample_k or 128, len(sql))
+        to_validate_idx = list(range(k))
 
-    if STRICT_MODE:
+    sql_to_check = [sql[i] for i in to_validate_idx]
+    errs = _validate_via_utils(sql_to_check, threads=threads, pq_timeout=pq_timeout, tot_timeout=tot_timeout)
+
+    bad_local = [i for i, e in enumerate(errs) if e]
+    if not bad_local:
+        return nl, sql, {"db_bad": 0, "checked": len(sql_to_check), "kept": len(sql), "dropped_db_error": 0}
+
+    # Map local indices back to global
+    bad_global = set(to_validate_idx[i] for i in bad_local)
+
+    print(f"[WARN] {split}: {len(bad_global)} / {len(sql_to_check)} checked queries raise DB errors.")
+    for j, gi in enumerate(sorted(bad_global)):
+        if j >= 10: break
+        print(f"  [ERR] idx={gi} -> (hidden message; see sanitizer logs in compute_records phase)")
+
+    if strict_mode:
         keep_nl, keep_sql = [], []
         dropped = 0
-        bad_set = set(bad_idx)
         for i, (x, y) in enumerate(zip(nl, sql)):
-            if i in bad_set:
+            if i in bad_global:
                 dropped += 1
                 continue
             keep_nl.append(x)
             keep_sql.append(y)
-        stats = {"db_bad": len(bad_idx), "kept": len(keep_sql), "dropped_db_error": dropped}
+        stats = {"db_bad": len(bad_global), "checked": len(sql_to_check), "kept": len(keep_sql), "dropped_db_error": dropped}
         return keep_nl, keep_sql, stats
     else:
-        stats = {"db_bad": len(bad_idx), "kept": len(sql), "dropped_db_error": 0}
+        stats = {"db_bad": len(bad_global), "checked": len(sql_to_check), "kept": len(sql), "dropped_db_error": 0}
         return nl, sql, stats
 
 # ---------- Per-split processing ----------
-def _sanitize_split(split: str) -> None:
+def _sanitize_split(
+    split: str,
+    strict_mode: bool,
+    validate_mode: str,
+    threads: int,
+    pq_timeout: float,
+    tot_timeout: float,
+    sample_k: int | None,
+) -> None:
     """
-    For 'train' and 'dev': sanitize (NL, SQL) pairs in-place + DB validation.
+    For 'train' and 'dev': sanitize (NL, SQL) pairs in-place + optional DB validation.
     For 'test': no SQL; just tidy NL.
     """
     nl_path = os.path.join(DATA_DIR, f"{split}.nl")
@@ -172,8 +204,12 @@ def _sanitize_split(split: str) -> None:
         # 1) Syntax-level cleanup
         nl_syn, sql_syn, s_stats = _sanitize_pairs(nl, sql)
 
-        # 2) DB-level validation
-        nl_ok, sql_ok, d_stats = _apply_db_validation(nl_syn, sql_syn, split=split)
+        # 2) DB-level validation (parallel via utils)
+        nl_ok, sql_ok, d_stats = _apply_db_validation(
+            nl_syn, sql_syn, split=split, strict_mode=strict_mode,
+            validate_mode=validate_mode, threads=threads,
+            pq_timeout=pq_timeout, tot_timeout=tot_timeout, sample_k=sample_k
+        )
 
         if len(nl_ok) == 0:
             raise RuntimeError(f"All {split} lines eliminated after validation; aborting to protect data.")
@@ -201,7 +237,7 @@ def _sanitize_split(split: str) -> None:
         raise ValueError(f"Unknown split: {split}")
 
 # ---------- Rebuild dev ground-truth ----------
-def _rebuild_dev_ground_truth_records():
+def _rebuild_dev_ground_truth_records(threads: int, pq_timeout: float, tot_timeout: float):
     from utils import read_queries, compute_records
     os.makedirs(RECORDS_DIR, exist_ok=True)
 
@@ -212,17 +248,18 @@ def _rebuild_dev_ground_truth_records():
         bak = _backup(gt_pkl_path)
         print(f"[INFO] Backed up existing ground truth records -> {bak}")
 
+    # Pass env knobs to compute_records for speed/robustness
+    os.environ["EVAL_THREADS"] = str(threads)
+    os.environ["PER_QUERY_TIMEOUT_SECS"] = str(pq_timeout)
+    os.environ["EVAL_TOTAL_TIMEOUT_SECS"] = str(tot_timeout)
+    os.environ["MAX_ERROR_FRACTION"] = "1.0"
+
     print("[INFO] Recomputing dev ground-truth records …")
     qs = read_queries(dev_sql_path)
     recs, errs = compute_records(qs)
     err_cnt = sum(1 for e in errs if e)
     if err_cnt:
-        print(f"[WARN] After sanitize, {err_cnt} / {len(errs)} dev SQL still raise DB errors.")
-        for i, e in enumerate(errs):
-            if e:
-                print(f"  [ERR] idx={i} -> {e}")
-                if i >= 15:
-                    break
+        print(f"[WARN] After sanitize, {err_cnt} / {len(errs)} dev SQL still raise DB errors (kept for parity).")
     else:
         print("[OK] All dev SQL executed successfully.")
 
@@ -231,12 +268,56 @@ def _rebuild_dev_ground_truth_records():
         pickle.dump((recs, errs), f)
     print(f"[OK] Saved rebuilt ground truth records -> {gt_pkl_path}")
 
+# ---------- CLI ----------
+def parse_args():
+    p = argparse.ArgumentParser(description="Sanitize NL/SQL dataset in-place, with optional DB validation and records rebuild.")
+    p.add_argument("--inplace", action="store_true", help="(kept for compatibility; sanitize is always in-place)")
+    p.add_argument("--validate", type=str, default="dev-only",
+                   choices=["none", "all", "dev-only", "sample"],
+                   help="DB validation scope. 'sample' validates only a head subset.")
+    p.add_argument("--sample-k", type=int, default=128, help="K examples to check when --validate sample")
+    p.add_argument("--records", type=str, default="auto",
+                   choices=["auto", "force", "skip"],
+                   help="Rebuild records/ground_truth_dev.pkl: auto (default), force, or skip.")
+    p.add_argument("--strict", dest="strict", action="store_true", default=STRICT_MODE_DEFAULT,
+                   help="Drop examples that fail DB validation.")
+    p.add_argument("--no-strict", dest="strict", action="store_false",
+                   help="Keep examples even if DB validation fails (just logs).")
+
+    # performance knobs
+    p.add_argument("--threads", type=int, default=int(os.getenv("EVAL_THREADS", "8")))
+    p.add_argument("--per-query-timeout", type=float, default=float(os.getenv("PER_QUERY_TIMEOUT_SECS", "2.5")))
+    p.add_argument("--total-timeout", type=float, default=float(os.getenv("EVAL_TOTAL_TIMEOUT_SECS", "90")))
+    return p.parse_args()
+
 def main():
+    args = parse_args()
+
     print(f"[INFO] Sanitizing in-place under: {DATA_DIR}")
-    _sanitize_split("train")
-    _sanitize_split("dev")
-    _sanitize_split("test")
-    _rebuild_dev_ground_truth_records()
+    # Train/dev/test
+    _sanitize_split("train", strict_mode=args.strict, validate_mode=args.validate,
+                    threads=args.threads, pq_timeout=args.per_query_timeout,
+                    tot_timeout=args.total_timeout, sample_k=args.sample_k)
+    _sanitize_split("dev",   strict_mode=args.strict, validate_mode=args.validate,
+                    threads=args.threads, pq_timeout=args.per_query_timeout,
+                    tot_timeout=args.total_timeout, sample_k=args.sample_k)
+    _sanitize_split("test",  strict_mode=args.strict, validate_mode="none",
+                    threads=args.threads, pq_timeout=args.per_query_timeout,
+                    tot_timeout=args.total_timeout, sample_k=args.sample_k)
+
+    # Records rebuild policy
+    if args.records == "skip":
+        print("[INFO] Skipping ground truth record rebuild per --records=skip.")
+    elif args.records == "force":
+        _rebuild_dev_ground_truth_records(args.threads, args.per_query_timeout, args.total_timeout)
+    else:
+        # auto: rebuild if file missing
+        gt_pkl_path  = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
+        if not os.path.exists(gt_pkl_path):
+            _rebuild_dev_ground_truth_records(args.threads, args.per_query_timeout, args.total_timeout)
+        else:
+            print("[INFO] ground_truth_dev.pkl exists; not rebuilding (use --records force to override).")
+
     print("[DONE] In-place sanitize complete.")
 
 if __name__ == "__main__":
