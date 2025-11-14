@@ -1,9 +1,11 @@
 import os
+import re
 import argparse
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import numpy as np
 import wandb
 
 from t5_utils import (
@@ -48,28 +50,20 @@ def get_args():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
 
-    parser.add_argument(
-        "--scheduler_type",
-        type=str,
-        default="linear",
-        choices=["none", "cosine", "linear"],
-        help="Whether to use a LR scheduler and what type to use if so",
-    )
-    parser.add_argument("--num_warmup_epochs", type=int,
-                        default=0, help="Warmup epochs if using a scheduler")
+    parser.add_argument("--scheduler_type", type=str, default="linear",
+                        choices=["none", "cosine", "linear"],
+                        help="Whether to use a LR scheduler and what type to use if so")
+    parser.add_argument("--num_warmup_epochs", type=int, default=0,
+                        help="Warmup epochs if using a scheduler")
     parser.add_argument("--max_n_epochs", type=int, default=3,
                         help="How many epochs to train the model for")
-    parser.add_argument(
-        "--patience_epochs",
-        type=int,
-        default=2,
-        help="If validation performance stops improving, how many epochs should we wait before stopping?",
-    )
+    parser.add_argument("--patience_epochs", type=int, default=2,
+                        help="Early stop if dev F1 does not improve")
 
     parser.add_argument("--use_wandb", action="store_true",
-                        help="If set, we will use wandb to keep track of experiments")
-    parser.add_argument("--experiment_name", type=str,
-                        default="dev", help="Experiment name (used in filenames)")
+                        help="Use wandb for experiment tracking")
+    parser.add_argument("--experiment_name", type=str, default="dev",
+                        help="Experiment name (used in filenames)")
 
     # Data hyperparameters
     parser.add_argument("--batch_size", type=int, default=16)
@@ -88,7 +82,7 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     epochs_since_improvement = 0
 
     model_type = "ft" if args.finetune else "scr"
-    experiment_name = args.experiment_name  # <-- use CLI value
+    experiment_name = args.experiment_name  # use CLI value
 
     checkpoint_dir = os.path.join(
         CHECKPOINTS_DIR, f"{model_type}_experiments", experiment_name)
@@ -97,9 +91,10 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
 
     # Dev file paths
     gt_sql_path = os.path.join(DATA_DIR, "dev.sql")
-    # Use the provided file name in the starter kit
-    gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
+    gt_record_path = os.path.join(
+        RECORDS_DIR, "ground_truth_dev.pkl")  # must exist
 
+    # Where to write model predictions for dev
     model_sql_path = os.path.join(
         RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
     model_record_path = os.path.join(
@@ -115,7 +110,9 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
             args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path
         )
         print(
-            f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
+            f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, "
+            f"Record EM: {record_em}, SQL EM: {sql_em}"
+        )
         print(
             f"Epoch {epoch}: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
@@ -183,6 +180,23 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
     return total_loss / max(1, total_tokens)
 
 
+def _extract_sql_like(s: str) -> str:
+    """
+    Safer extraction for generated sequences:
+    - prefer the first 'SELECT ... ;' block (case-insensitive)
+    - else, trim at first ';'
+    - else, return stripped string
+    """
+    s = s.strip()
+    m = re.search(r"(select\s.+?;)", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    semi = s.find(";")
+    if semi != -1:
+        return s[: semi + 1].strip()
+    return s
+
+
 def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
     """
     Evaluation loop on dev: CE loss + generation + metrics.
@@ -216,12 +230,15 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     # 2) Generation -> save -> metrics
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     gen_cfg = GenerationConfig(
-        max_new_tokens=args.gen_max_new_tokens, num_beams=args.gen_beam_size, do_sample=False)
+        max_new_tokens=args.gen_max_new_tokens,
+        num_beams=args.gen_beam_size,
+        do_sample=False
+    )
 
     sql_preds = []
     with torch.no_grad():
         for batch in tqdm(dev_loader, desc="Generate/Dev"):
-            # Works for both 5-tuple (train/dev) or 3-tuple (if reused)
+            # works for both 5-tuple (train/dev) or 3-tuple (if reused)
             if isinstance(batch, (list, tuple)):
                 if len(batch) == 5:
                     encoder_input, encoder_mask, _, _, _ = batch
@@ -242,8 +259,7 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
             )
             for seq in out:
                 s = tok.decode(seq, skip_special_tokens=True)
-                semi = s.find(";")
-                sql_preds.append(s[: semi + 1] if semi != -1 else s.strip())
+                sql_preds.append(_extract_sql_like(s))
 
     # Ensure output dirs exist
     os.makedirs(os.path.dirname(model_sql_path), exist_ok=True)
@@ -265,7 +281,10 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     model.eval()
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     gen_cfg = GenerationConfig(
-        max_new_tokens=args.gen_max_new_tokens, num_beams=args.gen_beam_size, do_sample=False)
+        max_new_tokens=args.gen_max_new_tokens,
+        num_beams=args.gen_beam_size,
+        do_sample=False
+    )
 
     sql_preds = []
     with torch.no_grad():
@@ -279,8 +298,7 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
             )
             for seq in out:
                 s = tok.decode(seq, skip_special_tokens=True)
-                semi = s.find(";")
-                sql_preds.append(s[: semi + 1] if semi != -1 else s.strip())
+                sql_preds.append(_extract_sql_like(s))
 
     os.makedirs(os.path.dirname(model_sql_path), exist_ok=True)
     os.makedirs(os.path.dirname(model_record_path), exist_ok=True)
@@ -303,7 +321,7 @@ def main():
     # Train
     train(args, model, train_loader, dev_loader, optimizer, scheduler)
 
-    # Evaluate
+    # Evaluate (reload best)
     model = load_model_from_checkpoint(args, best=True)
     model.eval()
 
@@ -311,7 +329,8 @@ def main():
     experiment_name = args.experiment_name
     model_type = "ft" if args.finetune else "scr"
     gt_sql_path = os.path.join(DATA_DIR, "dev.sql")
-    gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
+    gt_record_path = os.path.join(
+        RECORDS_DIR, "ground_truth_dev.pkl")  # must exist already
     model_sql_path = os.path.join(
         RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
     model_record_path = os.path.join(
