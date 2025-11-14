@@ -44,13 +44,13 @@ def get_args():
     # Training hyperparameters
     parser.add_argument("--optimizer_type", type=str,
                         default="AdamW", choices=["AdamW"])
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
 
     parser.add_argument("--scheduler_type", type=str, default="linear",
                         choices=["none", "cosine", "linear"])
     parser.add_argument("--num_warmup_epochs", type=int, default=0)
-    parser.add_argument("--max_n_epochs", type=int, default=3)
+    parser.add_argument("--max_n_epochs", type=int, default=5)
     parser.add_argument("--patience_epochs", type=int, default=2)
 
     parser.add_argument("--use_wandb", action="store_true")
@@ -61,9 +61,9 @@ def get_args():
     parser.add_argument("--test_batch_size", type=int, default=16)
 
     # Generation (eval/test)
-    parser.add_argument("--gen_max_new_tokens", type=int, default=48)
-    parser.add_argument("--gen_beam_size", type=int, default=4)
-    parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
+    parser.add_argument("--gen_max_new_tokens", type=int, default=96)
+    parser.add_argument("--gen_beam_size", type=int, default=8)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=4)
 
     return parser.parse_args()
 
