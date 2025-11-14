@@ -14,7 +14,6 @@ from t5_utils import (
     load_model_from_checkpoint,
     setup_wandb,
 )
-# <- use the chosen (clean/raw) root
 from load_data import load_t5_data, DATA_ROOT
 from utils import compute_metrics, save_queries_and_records, ensure_dev_ground_truth_records
 
@@ -22,7 +21,6 @@ DEVICE = torch.device(
     "cuda") if torch.cuda.is_available() else torch.device("cpu")
 PAD_IDX = 0
 
-# Resolve paths relative to this file
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
 RECORDS_DIR = os.path.join(
@@ -39,7 +37,6 @@ class StopOnSemicolon(StoppingCriteria):
         self.semi_id = tokenizer.convert_tokens_to_ids(";")
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # stop if ANY sequence just produced ';'
         return (input_ids[:, -1] == self.semi_id).any().item()
 
 
@@ -61,7 +58,6 @@ def get_args():
     p.add_argument("--test_batch_size", type=int, default=16)
     p.add_argument("--gen_max_new_tokens", type=int, default=128)
     p.add_argument("--gen_beam_size", type=int, default=8)
-    # fast CE-only dev every k epochs
     p.add_argument("--fast_eval_every", type=int, default=2)
     return p.parse_args()
 
@@ -88,7 +84,6 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     os.makedirs(checkpoint_dir, exist_ok=True)
     args.checkpoint_dir = checkpoint_dir
 
-    # Dev file paths (rooted in the same data dir the loaders used)
     gt_sql_path = os.path.join(DATA_ROOT, "dev.sql")
     gt_record_path = ensure_dev_ground_truth_records(DATA_ROOT, RECORDS_DIR)
 
@@ -103,7 +98,6 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
         print(f"Epoch {epoch}: Average train loss was {tr_loss}")
 
-        # every N epochs do fast CE-only (skip generation) to keep things snappy
         fast = (epoch % max(1, args.fast_eval_every) != 0)
         eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(
             args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path, fast=fast
@@ -117,11 +111,8 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         if args.use_wandb:
             wandb.log(
                 {
-                    "train/loss": tr_loss,
-                    "dev/loss": eval_loss,
-                    "dev/record_f1": record_f1,
-                    "dev/record_em": record_em,
-                    "dev/sql_em": sql_em,
+                    "train/loss": tr_loss, "dev/loss": eval_loss,
+                    "dev/record_f1": record_f1, "dev/record_em": record_em, "dev/sql_em": sql_em,
                     "dev/error_rate": error_rate if not fast else -1.0,
                 },
                 step=epoch,
@@ -136,7 +127,6 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         save_model(checkpoint_dir, model, best=False)
         if epochs_since_improvement == 0:
             save_model(checkpoint_dir, model, best=True)
-
         if epochs_since_improvement >= args.patience_epochs:
             break
 
@@ -144,7 +134,6 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
 def train_epoch(args, model, train_loader, optimizer, scheduler):
     model.train()
     total_loss, total_tokens = 0.0, 0
-    # label smoothing helps seq2seq fine-tuning
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.1)
 
     for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(train_loader, desc="Train"):
@@ -178,7 +167,6 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
 
 def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path, fast=False):
     model.eval()
-    # CE on dev
     ce_loss, total_tokens = 0.0, 0
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
@@ -201,24 +189,24 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
 
     ce_loss /= max(1, total_tokens)
     if fast:
-        # no generation/metrics to save time
         return ce_loss, 0.0, 0.0, 0.0, 0.0
 
-    # Generation -> save -> metrics
+    # --------- Generation (seed decoder with "SELECT ") ----------
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     stoppers = StoppingCriteriaList([StopOnSemicolon(tok)])
 
-    # force the presence of "SELECT" to curb rambles
-    select_ids = tok.encode("SELECT", add_special_tokens=False)
     gen_cfg = GenerationConfig(
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_beam_size,
         do_sample=False,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
-        decoder_start_token_id=tok.pad_token_id,
-        force_words_ids=[select_ids],
+        # NOTE: no decoder_start_token_id, we'll pass decoder_input_ids instead
     )
+
+    select_prefix_ids = tok.encode("SELECT ", add_special_tokens=False)
+    select_prefix = torch.tensor(
+        select_prefix_ids, dtype=torch.long, device=DEVICE)
 
     sql_preds = []
     with torch.no_grad():
@@ -235,10 +223,14 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
 
             encoder_input = encoder_input.to(DEVICE)
             encoder_mask = encoder_mask.to(DEVICE)
+            B = encoder_input.size(0)
+            # seed the decoder with "SELECT "
+            start_ids = select_prefix.unsqueeze(0).repeat(B, 1)  # (B, Lprefix)
 
             out = model.generate(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
+                decoder_input_ids=start_ids,
                 generation_config=gen_cfg,
                 stopping_criteria=stoppers,
             )
@@ -253,7 +245,6 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     sql_em, record_em, record_f1, model_error_msgs = compute_metrics(
         gt_sql_pth, model_sql_path, gt_record_path, model_record_path
     )
-    # quick visibility into DB errors
     if model_error_msgs:
         bad = [(i, e) for i, e in enumerate(model_error_msgs) if e]
         print(
@@ -270,25 +261,31 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     model.eval()
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     stoppers = StoppingCriteriaList([StopOnSemicolon(tok)])
-    select_ids = tok.encode("SELECT", add_special_tokens=False)
+
     gen_cfg = GenerationConfig(
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_beam_size,
         do_sample=False,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
-        decoder_start_token_id=tok.pad_token_id,
-        force_words_ids=[select_ids],
     )
+
+    select_prefix_ids = tok.encode("SELECT ", add_special_tokens=False)
+    select_prefix = torch.tensor(
+        select_prefix_ids, dtype=torch.long, device=DEVICE)
 
     sql_preds = []
     with torch.no_grad():
-        for encoder_input, encoder_mask, initial_dec in tqdm(test_loader, desc="Generate/Test"):
+        for encoder_input, encoder_mask, _ in tqdm(test_loader, desc="Generate/Test"):
             encoder_input = encoder_input.to(DEVICE)
             encoder_mask = encoder_mask.to(DEVICE)
+            B = encoder_input.size(0)
+            start_ids = select_prefix.unsqueeze(0).repeat(B, 1)
+
             out = model.generate(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
+                decoder_input_ids=start_ids,
                 generation_config=gen_cfg,
                 stopping_criteria=stoppers,
             )
@@ -314,7 +311,6 @@ def main():
 
     train(args, model, train_loader, dev_loader, optimizer, scheduler)
 
-    # reload best and do final dev/test
     model = load_model_from_checkpoint(args, best=True).eval()
 
     model_type = "ft" if args.finetune else "scr"
