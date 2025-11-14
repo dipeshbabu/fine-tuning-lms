@@ -299,7 +299,7 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
         decoder_start_token_id=tok.pad_token_id,
         # NOTE: in current HF, constrained beam search via force_words_ids is only respected
         # for standard beam search. We keep it to bias the decoder.
-        force_words_ids=[select_ids],
+        # force_words_ids=[select_ids],
     )
 
     # load GT records to compute single-example F1 during rerank
