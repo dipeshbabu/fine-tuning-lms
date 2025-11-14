@@ -3,28 +3,24 @@ import re
 import time
 from typing import List, Tuple
 
-# --- Paths (resolve relative to this file) ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
+# --- Config ---
+STRICT_MODE = True  # set False to keep erroring queries but log them
 
-# --- Utils from your project to regenerate ground-truth records ---
-# We import lazily inside main() to avoid circular import during packaging
-# from utils import read_queries, compute_records
+# --- Paths ---
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(SCRIPT_DIR, "data")
+RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
+DB_PATH     = os.path.join(DATA_DIR, "flight_database.db")  # utils uses this default too
 
 # ---------- IO helpers ----------
-
-
 def _read_lines(p: str) -> List[str]:
     with open(p, "r", encoding="utf-8") as f:
         return [ln.rstrip("\n") for ln in f]
-
 
 def _write_lines(p: str, lines: List[str]) -> None:
     with open(p, "w", encoding="utf-8") as f:
         for ln in lines:
             f.write(ln + "\n")
-
 
 def _backup(path: str) -> str:
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -33,56 +29,46 @@ def _backup(path: str) -> str:
         dst.write(src.read())
     return bak
 
-
 # ---------- SQL normalization / filters ----------
 _SELECT_RE = re.compile(r"^\s*select\b", flags=re.IGNORECASE)
-_SELECT_DISTINCT_FUSER = re.compile(
-    r"^\s*select\s*distinct", flags=re.IGNORECASE)
 _MULTI_SPACE = re.compile(r"\s+")
-
 
 def _looks_like_select(sql: str) -> bool:
     return bool(_SELECT_RE.match(sql or ""))
-
 
 def _normalize_sql(sql: str) -> str:
     """Format-only cleanup; no semantic edits."""
     s = (sql or "").strip()
 
-    # If there are accidental quotes wrapping everything, strip them.
+    # Strip paired quotes around entire line
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1].strip()
 
-    # Ensure a space in 'SELECTDISTINCT' if it ever appears fused.
-    s = re.sub(r"^\s*select\s*distinct",
-               "SELECT DISTINCT", s, flags=re.IGNORECASE)
+    # Fix fused "selectdistinct" if it happens
+    s = re.sub(r"^\s*select\s*distinct", "SELECT DISTINCT", s, flags=re.IGNORECASE)
 
     # Collapse whitespace runs
     s = _MULTI_SPACE.sub(" ", s)
 
-    # If there are multiple semicolons, keep the first statement up to first ';'
+    # Keep only first statement if multiple ';'
     semi = s.find(";")
     if semi != -1:
         s = s[: semi + 1]
 
-    # Ensure we end with a single ';'
+    # Ensure single trailing ';'
     if not s.endswith(";"):
         s = s + ";"
 
-    # Uppercase the leading SELECT/SELECT DISTINCT token(s) for consistency
+    # Normalize leading SELECT tokens
     if s.lower().startswith("select distinct"):
         s = "SELECT DISTINCT" + s[len("select distinct"):]
-
     elif s.lower().startswith("select"):
         s = "SELECT" + s[len("select"):]
 
     return s.strip()
 
-
 def _sanitize_pairs(nl: List[str], sql: List[str]) -> Tuple[List[str], List[str], dict]:
-    """Drop clearly malformed lines; normalize the rest."""
-    assert len(nl) == len(sql), "NL/SQL length mismatch before sanitize"
-
+    """Drop clearly malformed lines; normalize the rest (syntax-level only)."""
     keep_nl, keep_sql = [], []
     dropped_no_select = 0
     normalized = 0
@@ -90,30 +76,79 @@ def _sanitize_pairs(nl: List[str], sql: List[str]) -> Tuple[List[str], List[str]
     for x, y in zip(nl, sql):
         y_stripped = (y or "").strip()
         if not _looks_like_select(y_stripped):
-            # Drop pairs without a SELECT at the start — these poison training/eval.
             dropped_no_select += 1
             continue
-
         y_norm = _normalize_sql(y_stripped)
         if y_norm != y_stripped:
             normalized += 1
-
-        keep_nl.append(x.strip())
+        keep_nl.append((x or "").strip())
         keep_sql.append(y_norm)
 
     stats = {
         "original": len(nl),
-        "kept": len(keep_nl),
+        "kept_after_syntax": len(keep_nl),
         "dropped_no_select": dropped_no_select,
         "normalized_sql_lines": normalized,
     }
     return keep_nl, keep_sql, stats
 
+# ---------- DB validation ----------
+def _validate_against_db(sql_list: List[str]) -> List[str]:
+    """
+    Execute each SQL against the SQLite DB and return error message list ("" means success).
+    Uses the same logic as utils.compute_records to ensure consistency.
+    """
+    import sqlite3
+    errors = []
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for q in sql_list:
+        try:
+            cur.execute(q)
+            _ = cur.fetchall()
+            errors.append("")
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+    conn.close()
+    return errors
 
+def _apply_db_validation(nl: List[str], sql: List[str], split: str) -> Tuple[List[str], List[str], dict]:
+    """
+    Run SQLs; drop pairs with DB errors if STRICT_MODE=True, otherwise keep and report.
+    """
+    errs = _validate_against_db(sql)
+    bad_idx = [i for i, e in enumerate(errs) if e]
+
+    if not bad_idx:
+        return nl, sql, {"db_bad": 0, "kept": len(sql), "dropped_db_error": 0}
+
+    print(f"[WARN] {split}: {len(bad_idx)} / {len(sql)} queries raise DB errors.")
+    for i in bad_idx[:10]:
+        print(f"  [ERR] idx={i} -> {errs[i]}")
+    if len(bad_idx) > 10:
+        print(f"  ... {len(bad_idx)-10} more")
+
+    if STRICT_MODE:
+        keep_nl, keep_sql = [], []
+        dropped = 0
+        bad_set = set(bad_idx)
+        for i, (x, y) in enumerate(zip(nl, sql)):
+            if i in bad_set:
+                dropped += 1
+                continue
+            keep_nl.append(x)
+            keep_sql.append(y)
+        stats = {"db_bad": len(bad_idx), "kept": len(keep_sql), "dropped_db_error": dropped}
+        return keep_nl, keep_sql, stats
+    else:
+        stats = {"db_bad": len(bad_idx), "kept": len(sql), "dropped_db_error": 0}
+        return nl, sql, stats
+
+# ---------- Per-split processing ----------
 def _sanitize_split(split: str) -> None:
     """
-    For 'train' and 'dev': sanitize (NL, SQL) pairs in-place.
-    For 'test': no SQL; just trim NL lines.
+    For 'train' and 'dev': sanitize (NL, SQL) pairs in-place + DB validation.
+    For 'test': no SQL; just tidy NL.
     """
     nl_path = os.path.join(DATA_DIR, f"{split}.nl")
     if not os.path.exists(nl_path):
@@ -126,27 +161,32 @@ def _sanitize_split(split: str) -> None:
 
         nl = _read_lines(nl_path)
         sql = _read_lines(sql_path)
-        if len(nl) != len(sql):
-            print(
-                f"[WARN] {split}: length mismatch before sanitize: NL={len(nl)} SQL={len(sql)}. Proceeding…")
 
-        # Backup originals
-        nl_bak = _backup(nl_path)
+        if len(nl) != len(sql):
+            print(f"[WARN] {split}: length mismatch before sanitize: NL={len(nl)} SQL={len(sql)}")
+
+        # Backups
+        nl_bak  = _backup(nl_path)
         sql_bak = _backup(sql_path)
 
-        # Sanitize
-        nl_s, sql_s, stats = _sanitize_pairs(nl, sql)
-        if len(nl_s) == 0:
-            raise RuntimeError(
-                f"All {split} lines dropped as malformed; aborting to protect data.")
+        # 1) Syntax-level cleanup
+        nl_syn, sql_syn, s_stats = _sanitize_pairs(nl, sql)
 
-        _write_lines(nl_path, nl_s)
-        _write_lines(sql_path, sql_s)
+        # 2) DB-level validation
+        nl_ok, sql_ok, d_stats = _apply_db_validation(nl_syn, sql_syn, split=split)
+
+        if len(nl_ok) == 0:
+            raise RuntimeError(f"All {split} lines eliminated after validation; aborting to protect data.")
+
+        # Write back
+        _write_lines(nl_path, nl_ok)
+        _write_lines(sql_path, sql_ok)
 
         print(f"[OK] {split}: wrote sanitized files in-place.")
         print(f"     backup NL  -> {nl_bak}")
         print(f"     backup SQL -> {sql_bak}")
-        print(f"     stats: {stats}")
+        print(f"     syntax stats: {s_stats}")
+        print(f"     db stats:     {d_stats}")
 
     elif split == "test":
         # Just tidy NL
@@ -156,38 +196,32 @@ def _sanitize_split(split: str) -> None:
         _write_lines(nl_path, nl_s)
         print(f"[OK] {split}: wrote sanitized NL in-place.")
         print(f"     backup NL  -> {nl_bak}")
-        print(
-            f"     stats: original={len(nl)} kept={len(nl_s)} dropped_empty={len(nl) - len(nl_s)}")
+        print(f"     stats: original={len(nl)} kept={len(nl_s)} dropped_empty={len(nl) - len(nl_s)}")
     else:
         raise ValueError(f"Unknown split: {split}")
 
-
+# ---------- Rebuild dev ground-truth ----------
 def _rebuild_dev_ground_truth_records():
-    """Recompute records/ground_truth_dev.pkl from sanitized dev.sql."""
-    from utils import read_queries, compute_records  # lazy import to avoid tool-order issues
+    from utils import read_queries, compute_records
     os.makedirs(RECORDS_DIR, exist_ok=True)
 
     dev_sql_path = os.path.join(DATA_DIR, "dev.sql")
-    gt_pkl_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
+    gt_pkl_path  = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
 
-    # Backup existing pickle if present
     if os.path.exists(gt_pkl_path):
         bak = _backup(gt_pkl_path)
         print(f"[INFO] Backed up existing ground truth records -> {bak}")
 
-    print("[INFO] Recomputing dev ground-truth records … this may take a minute.")
+    print("[INFO] Recomputing dev ground-truth records …")
     qs = read_queries(dev_sql_path)
     recs, errs = compute_records(qs)
-
-    # Show a small summary of SQL execution errors (should be ~0 after sanitize)
     err_cnt = sum(1 for e in errs if e)
     if err_cnt:
-        print(
-            f"[WARN] {err_cnt} / {len(errs)} dev SQL queries still raise DB errors after sanitize.")
+        print(f"[WARN] After sanitize, {err_cnt} / {len(errs)} dev SQL still raise DB errors.")
         for i, e in enumerate(errs):
             if e:
                 print(f"  [ERR] idx={i} -> {e}")
-                if i >= 10:
+                if i >= 15:
                     break
     else:
         print("[OK] All dev SQL executed successfully.")
@@ -197,7 +231,6 @@ def _rebuild_dev_ground_truth_records():
         pickle.dump((recs, errs), f)
     print(f"[OK] Saved rebuilt ground truth records -> {gt_pkl_path}")
 
-
 def main():
     print(f"[INFO] Sanitizing in-place under: {DATA_DIR}")
     _sanitize_split("train")
@@ -205,7 +238,6 @@ def main():
     _sanitize_split("test")
     _rebuild_dev_ground_truth_records()
     print("[DONE] In-place sanitize complete.")
-
 
 if __name__ == "__main__":
     main()
