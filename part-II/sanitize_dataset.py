@@ -1,15 +1,13 @@
 import os
 import re
 import sqlite3
+import argparse
 from typing import List, Tuple
 
+# --- default locations: inside part-II/ ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-DATA = os.path.join(ROOT, "data")
-DATA_CLEAN = os.path.join(ROOT, "data_clean")
-DB_PATH = os.path.join(ROOT, "data", "flight_database.db")
-
-os.makedirs(DATA_CLEAN, exist_ok=True)
+DEFAULT_DATA = os.path.join(SCRIPT_DIR, "data")
+DEFAULT_OUT = os.path.join(SCRIPT_DIR, "data_clean")
 
 
 def _read_lines(p: str) -> List[str]:
@@ -25,16 +23,15 @@ def _write_lines(p: str, lines: List[str]):
 
 
 def _first_select_block(sql: str) -> str:
+    """Trim to first SELECT... and first ';', ensure trailing ';'."""
     s = (sql or "").strip()
     m = re.search(r"(select\s.+)", s, flags=re.IGNORECASE | re.DOTALL)
     if m:
         s = m.group(1).strip()
-    # cut at first semicolon if any
     semi = s.find(";")
     if semi != -1:
         s = s[: semi + 1]
-    # normalize: ensure a single tail semicolon for teaching a clean stop
-    if not s.endswith(";"):
+    if s and not s.endswith(";"):
         s += ";"
     return s
 
@@ -43,6 +40,7 @@ def _is_valid_sql(sql: str, db_path: str) -> bool:
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
+        # EXPLAIN validates syntax/table names without running full query
         cur.execute("EXPLAIN QUERY PLAN " + sql)
         conn.close()
         return True
@@ -50,10 +48,14 @@ def _is_valid_sql(sql: str, db_path: str) -> bool:
         return False
 
 
-def _sanitize_split(split: str) -> Tuple[int, int, int]:
-    nl_path = os.path.join(DATA, f"{split}.nl")
-    sql_path = os.path.join(DATA, f"{split}.sql")
+def _sanitize_split(split: str, data_dir: str, out_dir: str, db_path: str) -> Tuple[int, int, int]:
+    nl_path = os.path.join(data_dir, f"{split}.nl")
+    sql_path = os.path.join(data_dir, f"{split}.sql")
     has_sql = os.path.exists(sql_path)
+
+    if not os.path.exists(nl_path):
+        raise FileNotFoundError(
+            f"Missing NL file for split '{split}': {nl_path}")
 
     nl = _read_lines(nl_path)
     sql = _read_lines(sql_path) if has_sql else []
@@ -62,45 +64,77 @@ def _sanitize_split(split: str) -> Tuple[int, int, int]:
     dropped, fixed = 0, 0
 
     if has_sql:
-        assert len(nl) == len(
-            sql), f"size mismatch for {split}: {len(nl)} vs {len(sql)}"
-        for x, y in zip(nl, sql):
-            raw = y
-            y = _first_select_block(y)
+        if len(nl) != len(sql):
+            raise ValueError(
+                f"Size mismatch for {split}: NL={len(nl)} vs SQL={len(sql)}")
 
-            if not re.search(r"^\s*select\s", y, flags=re.IGNORECASE):
+        for x, y in zip(nl, sql):
+            raw = (y or "").strip()
+            y1 = _first_select_block(raw)
+
+            # must start with SELECT
+            if not re.search(r"^\s*select\s", y1, flags=re.IGNORECASE):
                 dropped += 1
                 continue
 
-            if not _is_valid_sql(y, DB_PATH):
-                y2 = _first_select_block(raw)
-                if not _is_valid_sql(y2, DB_PATH):
-                    dropped += 1
-                    continue
-                y = y2
-                fixed += 1
+            # validate; if invalid, try the same trimmed form again (no-op) then drop
+            if not _is_valid_sql(y1, db_path):
+                # nothing else to salvage here; drop
+                dropped += 1
+                continue
 
             out_nl.append((x or "").strip())
-            out_sql.append((y or "").strip())
+            out_sql.append(y1)
+            if y1 != raw:
+                fixed += 1
 
-        _write_lines(os.path.join(DATA_CLEAN, f"{split}.nl"), out_nl)
-        _write_lines(os.path.join(DATA_CLEAN, f"{split}.sql"), out_sql)
+        _write_lines(os.path.join(out_dir, f"{split}.nl"), out_nl)
+        _write_lines(os.path.join(out_dir, f"{split}.sql"), out_sql)
         kept = len(out_nl)
     else:
-        _write_lines(os.path.join(DATA_CLEAN, f"{split}.nl"), nl)
+        # test split (no SQL)
+        _write_lines(os.path.join(out_dir, f"{split}.nl"), nl)
         kept = len(nl)
 
     return kept, fixed, dropped
 
 
 def main():
-    kt, ft, dt = _sanitize_split("train")
-    kd, fd, dd = _sanitize_split("dev")
-    kx, fx, dx = _sanitize_split("test")
+    ap = argparse.ArgumentParser(
+        description="Sanitize NL/SQL dataset in part-II/")
+    ap.add_argument("--data-dir", default=DEFAULT_DATA,
+                    help="Input data dir (default: part-II/data)")
+    ap.add_argument("--out-dir",  default=DEFAULT_OUT,
+                    help="Output cleaned dir (default: part-II/data_clean)")
+    ap.add_argument("--db", default=None,
+                    help="Path to SQLite DB (default: <data-dir>/flight_database.db)")
+    args = ap.parse_args()
+
+    data_dir = os.path.abspath(args.data_dir)
+    out_dir = os.path.abspath(args.out_dir)
+    db_path = args.db or os.path.join(data_dir, "flight_database.db")
+
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"data dir not found: {data_dir}")
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"SQLite DB not found at {db_path}")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # train/dev/test
+    kt, ft, dt = _sanitize_split("train", data_dir, out_dir, db_path)
     print(f"[train] kept={kt} fixed={ft} dropped={dt}")
+    kd, fd, dd = _sanitize_split("dev",   data_dir, out_dir, db_path)
     print(f"[dev]   kept={kd} fixed={fd} dropped={dd}")
-    print(f"[test]  kept={kx}")
+
+    # test has only NL
+    try:
+        kx, fx, dx = _sanitize_split("test",  data_dir, out_dir, db_path)
+        print(f"[test]  kept={kx}")
+    except FileNotFoundError:
+        print("[test]  no test split found; skipping")
 
 
 if __name__ == "__main__":
     main()
+#
