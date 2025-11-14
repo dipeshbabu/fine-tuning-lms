@@ -1,53 +1,23 @@
-import torch
-from transformers import T5TokenizerFast
 import os
+import nltk
+import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
+from transformers import T5TokenizerFast
 
-import nltk
 nltk.download('punkt')
 
 PAD_IDX = 0
 
-# resolve data folder relative to this file
+# Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(SCRIPT_DIR, "data")
-
-# ---- schema helpers ----
-
-
-def _read_text_if_exists(path):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return ""
+DATA_CLEAN_ROOT = os.path.join(SCRIPT_DIR, "data_clean")
 
 
-def _find_schema_text(data_root: str) -> str:
-    """
-    Try a few common filenames to locate a schema file that describes the SQLite DB.
-    Falls back to empty string if not found (safe).
-    """
-    candidates = [
-        os.path.join(data_root, "schema.txt"),
-        os.path.join(data_root, "database.schema"),
-        os.path.join(data_root, "flight_database.schema"),
-        os.path.join(data_root, "tables.schema"),
-        os.path.join(data_root, "schema"),
-    ]
-    for p in candidates:
-        txt = _read_text_if_exists(p)
-        if txt:
-            return txt
-    return ""
-
-
-def _shift_right(labels, pad_token_id: int):
-    """Create decoder inputs by shifting targets to the right (T5-style)."""
-    bsz, seqlen = labels.shape
-    start_tokens = torch.full((bsz, 1), pad_token_id, dtype=labels.dtype)
-    shifted = torch.cat([start_tokens, labels[:, :-1]], dim=1)
-    return shifted
+def _choose_data_root():
+    # Prefer cleaned data if present
+    return DATA_CLEAN_ROOT if os.path.isdir(DATA_CLEAN_ROOT) else DATA_ROOT
 
 
 def _load_lines(path):
@@ -55,39 +25,20 @@ def _load_lines(path):
         return [ln.strip() for ln in f.readlines()]
 
 
+def _shift_right(labels, pad_token_id: int):
+    bsz, seqlen = labels.shape
+    start_tokens = torch.full((bsz, 1), pad_token_id, dtype=labels.dtype)
+    shifted = torch.cat([start_tokens, labels[:, :-1]], dim=1)
+    return shifted
+
+
 class T5Dataset(Dataset):
     def __init__(self, data_folder, split):
-        """
-        Provides inputs/targets for T5:
-          encoder input  : 'translate to SQL given schema:\\n<SCHEMA>\\nQuestion: <NL>\\nSQL:'
-          decoder target : the gold SQL
-        On test split, decoder target is omitted.
-        """
-        self.data_folder = data_folder
         self.split = split
         self.tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
         self.pad_id = self.tokenizer.pad_token_id  # 0 for T5
-
-        # load full schema text once
-        self.schema_text = _find_schema_text(self.data_folder)
-        # modest guard if schema is huge
-        if len(self.schema_text) > 5000:
-            self.schema_text = self.schema_text[:5000]
-
-        self.items = self.process_data(data_folder, split, self.tokenizer)
-
-    def _make_encoder_string(self, nl: str) -> str:
-        """
-        Compose the encoder prompt with schema context.
-        """
-        if self.schema_text:
-            return (
-                "translate to SQL given schema:\n"
-                f"{self.schema_text}\n"
-                f"Question: {nl}\nSQL:"
-            )
-        else:
-            return f"translate to SQL: {nl}"
+        root = _choose_data_root()
+        self.items = self.process_data(root, split, self.tokenizer)
 
     def process_data(self, data_folder, split, tokenizer):
         nl_path = os.path.join(data_folder, f"{split}.nl")
@@ -96,13 +47,16 @@ class T5Dataset(Dataset):
         items = []
         if split == "test":
             for x in nl:
-                items.append({"nl": x, "sql": None})
+                # schema-aware prefix helps
+                nl_in = f"translate to SQL for the ATIS flight DB: {x}"
+                items.append({"nl": nl_in, "sql": None})
         else:
             sql_path = os.path.join(data_folder, f"{split}.sql")
             sql = _load_lines(sql_path)
             assert len(nl) == len(sql), f"NL/SQL size mismatch for {split}"
             for x, y in zip(nl, sql):
-                items.append({"nl": x, "sql": y})
+                nl_in = f"translate to SQL for the ATIS flight DB: {x}"
+                items.append({"nl": nl_in, "sql": y})
         return items
 
     def __len__(self):
@@ -111,19 +65,15 @@ class T5Dataset(Dataset):
     def __getitem__(self, idx):
         ex = self.items[idx]
         nl = ex["nl"]
-        enc_text = self._make_encoder_string(nl)
 
-        # Allow more room so schema fits
-        enc = self.tokenizer(
-            enc_text, truncation=True, max_length=512, return_tensors=None
-        )
+        enc = self.tokenizer(nl, truncation=True,
+                             max_length=256, return_tensors=None)
         enc_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
 
         if self.split == "test":
             return {"encoder_ids": enc_ids}
 
         sql = ex["sql"]
-        # targets usually fit in <=256
         dec = self.tokenizer(sql, truncation=True,
                              max_length=256, return_tensors=None)
         dec_ids = torch.tensor(dec["input_ids"], dtype=torch.long)
@@ -165,14 +115,11 @@ def test_collate_fn(batch):
 
 
 def get_dataloader(batch_size, split):
-    data_folder = DATA_ROOT
+    data_folder = _choose_data_root()
     dset = T5Dataset(data_folder, split)
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
-
-    dataloader = DataLoader(dset, batch_size=batch_size,
-                            shuffle=shuffle, collate_fn=collate_fn)
-    return dataloader
+    return DataLoader(dset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
 
 
 def load_t5_data(batch_size, test_batch_size):
