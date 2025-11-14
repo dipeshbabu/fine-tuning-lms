@@ -1,3 +1,4 @@
+from transformers import StoppingCriteria, StoppingCriteriaList
 import os
 import re
 import argparse
@@ -32,6 +33,17 @@ CHECKPOINTS_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(RECORDS_DIR, exist_ok=True)
 os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+
+
+class StopOnSemicolon(StoppingCriteria):
+    def __init__(self, tokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.semi_id = self.tokenizer.convert_tokens_to_ids(";")
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        # Stop if the last generated token is ';'
+        return input_ids[0, -1].item() == self.semi_id
 
 
 def get_args():
@@ -70,8 +82,8 @@ def get_args():
     parser.add_argument("--test_batch_size", type=int, default=16)
 
     # Generation hyperparameters (used in eval/test)
-    parser.add_argument("--gen_max_new_tokens", type=int, default=64)
-    parser.add_argument("--gen_beam_size", type=int, default=1)
+    parser.add_argument("--gen_max_new_tokens", type=int, default=32)
+    parser.add_argument("--gen_beam_size", type=int, default=4)
 
     args = parser.parse_args()
     return args
@@ -229,10 +241,14 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
 
     # 2) Generation -> save -> metrics
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    stoppers = StoppingCriteriaList([StopOnSemicolon(tok)])
     gen_cfg = GenerationConfig(
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_beam_size,
         do_sample=False
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        decoder_start_token_id=tok.pad_token_id,  # T5 decoder starts from pad
     )
 
     sql_preds = []
@@ -256,6 +272,7 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
                 generation_config=gen_cfg,
+                stopping_criteria=stoppers,
             )
             for seq in out:
                 s = tok.decode(seq, skip_special_tokens=True)
@@ -280,10 +297,14 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     """
     model.eval()
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    stoppers = StoppingCriteriaList([StopOnSemicolon(tok)])
     gen_cfg = GenerationConfig(
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_beam_size,
         do_sample=False
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        decoder_start_token_id=tok.pad_token_id,  # T5 decoder starts from pad
     )
 
     sql_preds = []
@@ -295,6 +316,7 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
                 generation_config=gen_cfg,
+                stopping_criteria=stoppers,
             )
             for seq in out:
                 s = tok.decode(seq, skip_special_tokens=True)
