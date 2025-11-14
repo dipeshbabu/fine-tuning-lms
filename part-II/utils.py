@@ -105,7 +105,8 @@ def compute_records(processed_qs: List[str]):
         # Fast-skip: only try the DB for reasonably valid-looking SELECTs
         if not re.match(r"(?is)^\s*select\b", q):
             # immediate "error" result, no DB call
-            futures.append(pool.submit(lambda idx=i: (idx, [], "Skipped: not a SELECT")))
+            futures.append(pool.submit(lambda idx=i: (
+                idx, [], "Skipped: not a SELECT")))
         else:
             futures.append(pool.submit(compute_record, i, q))
 
@@ -220,3 +221,23 @@ def set_random_seeds(seed_value=42):
     torch.cuda.manual_seed_all(seed_value)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def ensure_dev_ground_truth_records(data_dir: str, records_dir: str):
+    """
+    Build ground_truth_dev.pkl in `records_dir` from dev.sql in `data_dir` if missing.
+    Keeps your old format: pickle of (records, error_msgs).
+    """
+    os.makedirs(records_dir, exist_ok=True)
+    dev_sql_path = os.path.join(data_dir, "dev.sql")
+    gt_path = os.path.join(records_dir, "ground_truth_dev.pkl")
+    if not os.path.exists(dev_sql_path):
+        raise FileNotFoundError(f"Expected {dev_sql_path}")
+    if os.path.exists(gt_path):
+        return gt_path
+
+    qs = read_queries(dev_sql_path)
+    recs, errs = compute_records(qs)
+    with open(gt_path, "wb") as f:
+        pickle.dump((recs, errs), f)
+    return gt_path
