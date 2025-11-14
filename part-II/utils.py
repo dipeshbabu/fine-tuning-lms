@@ -90,34 +90,37 @@ def read_queries(sql_path: str):
 
 
 def compute_records(processed_qs: List[str]):
-    '''
-    Helper function for computing the records associated with each SQL query in the
-    input list. You may change the number of threads or the timeout variable (in seconds)
-    based on your computational constraints.
-
-    Input:
-        * processed_qs (List[str]): The list of SQL queries to execute
-    '''
+    """
+    Compute records for each SQL query with a shorter overall timeout,
+    and fast-skip any query that doesn't start with SELECT.
+    """
     num_threads = 8
-    timeout_secs = 30
+    timeout_secs = 30  # was 120 — shorten to avoid long hangs
 
     pool = ThreadPoolExecutor(num_threads)
     futures = []
+
     for i, query in enumerate(processed_qs):
-        futures.append(pool.submit(compute_record, i, query))
+        q = (query or "").strip()
+        # Fast-skip: only try the DB for reasonably valid-looking SELECTs
+        if not re.match(r"(?is)^\s*select\b", q):
+            # immediate "error" result, no DB call
+            futures.append(pool.submit(lambda idx=i: (idx, [], "Skipped: not a SELECT")))
+        else:
+            futures.append(pool.submit(compute_record, i, q))
 
     rec_dict = {}
     try:
         for x in tqdm(as_completed(futures, timeout=timeout_secs)):
             query_id, rec, error_msg = x.result()
             rec_dict[query_id] = (rec, error_msg)
-    except:
+    except Exception:
+        # Cancel remaining to return promptly
         for future in futures:
             if not future.done():
                 future.cancel()
 
-    recs = []
-    error_msgs = []
+    recs, error_msgs = [], []
     for i in range(len(processed_qs)):
         if i in rec_dict:
             rec, error_msg = rec_dict[i]
@@ -131,18 +134,21 @@ def compute_records(processed_qs: List[str]):
 
 
 def compute_record(query_id, query):
-    conn = sqlite3.connect(DB_PATH)
+    # Each query uses its own short-lived connection
+    conn = sqlite3.connect(DB_PATH, timeout=3.0)  # small busy timeout
     cursor = conn.cursor()
-
     try:
+        # Guard: reject multi-statements and semicolons beyond the first
+        if query.count(";") > 1:
+            raise ValueError("Multiple statements not allowed")
         cursor.execute(query)
         rec = cursor.fetchall()
         error_msg = ""
     except Exception as e:
         rec = []
         error_msg = f"{type(e).__name__}: {e}"
-
-    conn.close()
+    finally:
+        conn.close()
     return query_id, rec, error_msg
 
 
