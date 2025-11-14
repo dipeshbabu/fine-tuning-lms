@@ -1,6 +1,5 @@
 import os
 import argparse
-import random
 from tqdm import tqdm
 
 import torch
@@ -8,8 +7,8 @@ from transformers import GemmaTokenizerFast, GemmaForCausalLM
 from transformers import GemmaTokenizer, AutoModelForCausalLM
 from transformers import BitsAndBytesConfig
 
-from utils import set_random_seeds, compute_metrics, save_queries_and_records, compute_records
-from prompting_utils import read_schema, extract_sql_query, save_logs
+from utils import set_random_seeds, compute_metrics, save_queries_and_records
+from prompting_utils import extract_sql_query, save_logs
 from load_data import load_prompting_data
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available(

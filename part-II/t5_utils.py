@@ -26,7 +26,6 @@ def initialize_model(args):
     or training a T5 model initialized with the 'google-t5/t5-small' config
     from scratch.
     '''
-    # TODO
     if args.finetune:
         model = T5ForConditionalGeneration.from_pretrained(
             "google-t5/t5-small")
@@ -47,7 +46,6 @@ def mkdir(dirpath):
 
 def save_model(checkpoint_dir, model, best):
     # Save model checkpoint to be able to load the model later
-    # TODO
     sub = "best" if best else "last"
     out_dir = os.path.join(checkpoint_dir, sub)
     mkdir(out_dir)
@@ -56,7 +54,6 @@ def save_model(checkpoint_dir, model, best):
 
 def load_model_from_checkpoint(args, best):
     # Load model from a checkpoint
-    # TODO
     model_type = 'ft' if args.finetune else 'scr'
     ckpt_dir = getattr(args, "checkpoint_dir", os.path.join(
         "checkpoints", f"{model_type}_experiments", args.experiment_name))

@@ -1,12 +1,6 @@
 import torch
 from transformers import T5TokenizerFast
 import os
-import random
-import re
-import string
-from collections import Counter
-from tqdm import tqdm
-import pickle
 
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
@@ -18,8 +12,7 @@ PAD_IDX = 0
 
 # resolve data folder relative to this file
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_ROOT = os.path.join(SCRIPT_DIR, "data")\
-
+DATA_ROOT = os.path.join(SCRIPT_DIR, "data")
 
 
 def _shift_right(labels, pad_token_id: int):
@@ -48,7 +41,6 @@ class T5Dataset(Dataset):
               T5Tokenizer should serve that purpose.
             * Class behavior should be different on the test set.
         '''
-        # TODO
         self.data_folder = data_folder
         self.split = split
         self.tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
@@ -56,7 +48,6 @@ class T5Dataset(Dataset):
         self.items = self.process_data(data_folder, split, self.tokenizer)
 
     def process_data(self, data_folder, split, tokenizer):
-        # TODO
         nl_path = os.path.join(data_folder, f"{split}.nl")
         nl = _load_lines(nl_path)
 
@@ -73,11 +64,9 @@ class T5Dataset(Dataset):
         return items
 
     def __len__(self):
-        # TODO
         return len(self.items)
 
     def __getitem__(self, idx):
-        # TODO
         ex = self.items[idx]
         nl = ex["nl"]
         # Small task prefix helps T5 a bit
@@ -153,7 +142,6 @@ def test_collate_fn(batch):
         * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
-    # TODO
     encs = [b["encoder_ids"] for b in batch]
     enc_padded = pad_sequence(encs, batch_first=True, padding_value=PAD_IDX)
     encoder_mask = (enc_padded != PAD_IDX).long()
@@ -167,8 +155,15 @@ def get_dataloader(batch_size, split):
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
 
-    dataloader = DataLoader(dset, batch_size=batch_size,
-                            shuffle=shuffle, collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=4,            # tune to your machine; 0 on Windows if issues
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if torch.cuda.is_available() else False,
+    )
     return dataloader
 
 
@@ -187,7 +182,6 @@ def load_lines(path):
 
 
 def load_prompting_data(data_folder):
-    # TODO
     train_x = load_lines(os.path.join(data_folder, "train.nl"))
     train_y = load_lines(os.path.join(data_folder, "train.sql"))
     dev_x = load_lines(os.path.join(data_folder, "dev.nl"))

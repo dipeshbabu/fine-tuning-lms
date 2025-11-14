@@ -6,7 +6,6 @@ def read_schema(schema_path):
     '''
     Read the .schema file
     '''
-    # TODO
     # Minimal parser: return raw text and simple table->columns mapping if present
     schema = {"raw": "", "tables": {}}
     if not os.path.exists(schema_path):
@@ -28,7 +27,6 @@ def extract_sql_query(response):
     '''
     Extract the SQL query from the model's response
     '''
-    # TODO
     # Heuristic: take substring from first "select" (case-insensitive) to the end of the first ';'
     s = response.strip()
     m = re.search(r"(select\s.+?;)", s, flags=re.IGNORECASE | re.DOTALL)
