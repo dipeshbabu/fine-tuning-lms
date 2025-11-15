@@ -2,16 +2,14 @@ from transformers import (
     T5TokenizerFast,
     GenerationConfig,
     StoppingCriteria,
-    StoppingCriteriaList,
     LogitsProcessor,
+    LogitsProcessorList,
 )
 import os
 import re
 import argparse
 from tqdm import tqdm
-
 import sqlite3
-import string
 
 import torch
 import torch.nn as nn
@@ -26,10 +24,9 @@ from t5_utils import (
     setup_wandb,
 )
 from load_data import load_t5_data
-from utils import compute_metrics, save_queries_and_records
+from utils import compute_metrics, save_queries_and_records, DB_PATH
 
-# NOTE: utils.DB_PATH should already point to part-II/data/flight_database.db
-
+# Device / constants
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 PAD_IDX = 0
 
@@ -39,140 +36,164 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
 RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
 CHECKPOINTS_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
-DB_PATH = os.path.join(DATA_DIR, "flight_database.db")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(RECORDS_DIR, exist_ok=True)
 os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
 
-# --- Optional stop at first ';' (not strictly needed with our slice/extraction) ---
-class StopOnSemicolon(StoppingCriteria):
-    def __init__(self, tokenizer):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.semi_id = self.tokenizer.convert_tokens_to_ids(";")
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # stop as soon as we emit ';' (end of statement)
-        return input_ids[0, -1].item() == self.semi_id
-
-
-# ---------- NEW: Schema-constrained decoding ----------
+# =========================
+# Helpers: schema + masking
+# =========================
 
 _SQL_KEYWORDS = [
-    # core
-    "select", "from", "where", "group", "by", "order", "limit", "offset",
-    "having", "as", "and", "or", "not", "in", "between", "like", "is", "null",
-    "distinct", "on", "join", "inner", "left", "right", "full", "outer", "cross",
-    "union", "all", "intersect", "except",
-    # functions & agg
-    "count", "sum", "avg", "min", "max", "upper", "lower", "substr", "length",
-    # sorting
-    "asc", "desc",
-    # sqlite specifics often used
-    "case", "when", "then", "end",
+    "select", "from", "where", "and", "or", "group", "by", "order", "asc", "desc",
+    "limit", "having", "join", "inner", "left", "right", "full", "on", "as",
+    "distinct", "count", "sum", "avg", "min", "max", "between", "in", "like", "not",
+    "is", "null", "exists", "union", "all"
 ]
-
-_SQL_SYMS = list("(),.*=<>!+-/%;") + ["||"]  # include concat
+_SQL_SYMS = ["*", "(", ")", ",", ".", ";", "=", "!=", "<>", "<", ">", "<=", ">="]
 _DIGITS = list("0123456789")
 
-
-def _read_schema_lexicon(db_path: str):
-    """Read tables and columns from sqlite schema for whitelist."""
-    tables, columns = set(), set()
-    con = sqlite3.connect(db_path)
-    try:
-        cur = con.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        for (tname,) in cur.fetchall():
-            if tname.startswith("sqlite_"):
-                continue
-            tables.add(tname)
-            try:
-                cur.execute(f"PRAGMA table_info('{tname}');")
-                for _, cname, *_ in cur.fetchall():
-                    columns.add(cname)
-            except Exception:
-                pass
-    finally:
-        con.close()
-    return sorted(tables), sorted(columns)
-
-
-def _build_allowed_token_ids(tokenizer: T5TokenizerFast, db_path: str):
+def _read_schema_lexicon(sqlite_path: str):
     """
-    Build a permissive whitelist of token IDs comprised of:
-      - special tokens (pad, eos)
-      - SQL keywords (lowercase)
-      - table & column names
-      - punctuation/symbols and digits
-    For T5 sentencepiece, we include any sub-token that is a piece of these words.
+    Introspect sqlite DB to get table and column names.
     """
-    tables, columns = _read_schema_lexicon(db_path)
-    vocab = tokenizer.get_vocab()
-    inv_vocab = {tid: tok for tok, tid in vocab.items()}
+    tables, columns = [], []
+    if not os.path.exists(sqlite_path):
+        return tables, columns
+    conn = sqlite3.connect(sqlite_path)
+    cur = conn.cursor()
+    # tables
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [r[0] for r in cur.fetchall() if r and r[0]]
+    # columns per table
+    for t in tables:
+        try:
+            cur.execute(f"PRAGMA table_info({t});")
+            cols = [r[1] for r in cur.fetchall() if len(r) >= 2]
+            columns.extend(cols)
+        except Exception:
+            pass
+    conn.close()
+    return tables, columns
 
-    # Make a bag of words we care about
-    words = set(_SQL_KEYWORDS + tables + columns)
-    # Also include raw symbols and digits as separate "words"
+def _ids_for(tokenizer: T5TokenizerFast, s: str):
+    # collect ids used to spell s under common contexts
+    ids = set(tokenizer.encode(" " + s, add_special_tokens=False))
+    ids.update(tokenizer.encode(s, add_special_tokens=False))
+    return {i for i in ids if i is not None}
+
+def _build_allowed_token_ids(tokenizer: T5TokenizerFast, sqlite_path: str):
+    tables, columns = _read_schema_lexicon(sqlite_path)
+    keep_ids = set()
+    # specials
+    for sid in [tokenizer.pad_token_id, tokenizer.eos_token_id]:
+        if sid is not None:
+            keep_ids.add(sid)
+    # SQL words
+    for w in _SQL_KEYWORDS:
+        keep_ids |= _ids_for(tokenizer, w.lower())
+    # identifiers
+    for name in tables + columns:
+        keep_ids |= _ids_for(tokenizer, name.lower())
+    # symbols/digits
     for sym in _SQL_SYMS:
-        words.add(sym)
+        keep_ids |= _ids_for(tokenizer, sym)
     for d in _DIGITS:
-        words.add(d)
-
-    allowed_ids = set()
-
-    # Always keep pad/eos
-    for tok in [tokenizer.pad_token, tokenizer.eos_token]:
-        if tok is not None and tok in vocab:
-            allowed_ids.add(vocab[tok])
-
-    # SP tokens can be like '▁select' or 'ect' etc.
-    # We'll allow any token that is:
-    #   - exactly a keyword/table/column (with or without leading '▁')
-    #   - a subpiece contained in those strings
-    def norm(s):
-        return s.lower()
-
-    target_strings = set()
-    for w in words:
-        w = norm(w)
-        if not w:
-            continue
-        target_strings.add(w)
-        target_strings.add(" " + w)  # help subword '▁w'
-
-    # Iterate over all tokens and keep those that are substrings of our targets
-    for tid, tok in inv_vocab.items():
-        # strip sentencepiece underline but keep the raw form too
-        raw = tok.replace("▁", " ").lower()
-        if any(raw in ts for ts in target_strings):
-            allowed_ids.add(tid)
-
-    return allowed_ids
-
+        keep_ids |= _ids_for(tokenizer, d)
+    return keep_ids, tables
 
 class SchemaConstrainedSQLProcessor(LogitsProcessor):
     """
-    Masks logits to a schema-aware whitelist. Strongly reduces SQL syntax/identifier errors.
-    Still permissive enough to let the model compose pieces.
+    Hard-mask logits to an allowlist derived from tokenizer+schema.
     """
-    def __init__(self, allowed_ids: set[int], keep_special: set[int] | None = None):
-        self.allowed_ids = set(allowed_ids)
+    def __init__(self, allowed_ids: set[int], keep_special: set[int] = None):
+        self.allowed = set(allowed_ids or [])
         self.keep_special = set(keep_special or [])
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         # scores: [batch, vocab]
-        # Mask everything not in allowed_ids (except explicitly kept specials)
-        mask = torch.full_like(scores, fill_value=float("-inf"))
-        # keep allowed ids
-        idx = torch.tensor(list(self.allowed_ids | self.keep_special), device=scores.device, dtype=torch.long)
+        if not self.allowed:
+            return scores
+        mask = torch.full_like(scores, float("-inf"))
+        idx = torch.tensor(list(self.allowed | self.keep_special), device=scores.device, dtype=torch.long)
         mask[:, idx] = 0.0
         return scores + mask
 
+class ForceSelectAtStart(LogitsProcessor):
+    """
+    On the very first decoding step, only allow tokens that compose 'select'.
+    """
+    def __init__(self, tokenizer: T5TokenizerFast):
+        sel = tokenizer.encode(" select", add_special_tokens=False)
+        if not sel:
+            sel = tokenizer.encode("select", add_special_tokens=False)
+        self.allowed_first = set(sel)
 
-# ------------------------------------------------------
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
+        # decoder starts from <pad>; step_len==1 means first non-pad choice
+        if input_ids.shape[1] == 1 and self.allowed_first:
+            mask = torch.full_like(scores, float("-inf"))
+            idx = torch.tensor(list(self.allowed_first), device=scores.device, dtype=torch.long)
+            mask[:, idx] = 0.0
+            return scores + mask
+        return scores
 
+class StopOnSemicolon(StoppingCriteria):
+    """
+    Stop if the last produced token matches the tokenizer-encoded semicolon.
+    Robust to SentencePiece segmentations.
+    """
+    def __init__(self, tokenizer: T5TokenizerFast):
+        super().__init__()
+        enc = tokenizer.encode(";", add_special_tokens=False)
+        self.semi_id = enc[-1] if enc else None
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        return self.semi_id is not None and input_ids[0, -1].item() == self.semi_id
+
+
+def _repair_sql(q: str, known_tables: list[str]) -> str:
+    """
+    Lightweight repair pass to turn malformed candidates into runnable SQL.
+    """
+    s = q.strip()
+    # Ensure SELECT starts the statement
+    if not re.search(r'^\s*select\b', s, re.I):
+        s = "SELECT " + s
+
+    # Remove stray commas right after SELECT
+    s = re.sub(r'^\s*(select)\s*,+', r'\1 * ', s, flags=re.I)
+
+    # Ensure FROM clause exists
+    if " from " not in s.lower():
+        default = None
+        if known_tables:
+            # choose a common/default table if exists
+            for cand in ["flight", "flights", "airline", "airport"]:
+                if any(t.lower() == cand for t in known_tables):
+                    default = cand
+                    break
+            if default is None:
+                default = known_tables[0]
+        if default:
+            # If there is nothing selected, switch to SELECT * FROM default
+            if re.search(r'^\s*select\s*;', s, re.I):
+                s = re.sub(r'^\s*select\s*;', f"SELECT * FROM {default};", s, flags=re.I)
+            elif re.search(r'^\s*select\s*$', s, re.I):
+                s = f"SELECT * FROM {default};"
+            elif re.search(r'^\s*select\s+[^;]+$', s, re.I):
+                s = s + f" FROM {default}"
+
+    # Ensure terminal semicolon
+    if not s.endswith(";"):
+        s += ";"
+    return s
+
+
+# =================
+# CLI and arguments
+# =================
 
 def get_args():
     parser = argparse.ArgumentParser(description="T5 training loop")
@@ -201,6 +222,10 @@ def get_args():
     parser.add_argument("--gen_beam_size", type=int, default=8)
     parser.add_argument("--num_return_sequences", type=int, default=8)
 
+    # Extra generation knobs
+    parser.add_argument("--length_penalty", type=float, default=0.6)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
+
     # Fast eval during training (speeds up between-epoch evaluation)
     parser.add_argument("--fast_eval", action="store_true",
                         help="Use light generation params during training eval; final dev+test use full params.")
@@ -208,20 +233,22 @@ def get_args():
     parser.add_argument("--train_eval_k", type=int, default=2)
     parser.add_argument("--train_eval_max_new", type=int, default=64)
 
-    # Reranking logic
+    # Constraints + reranking
+    parser.add_argument("--constrain_sql", action="store_true",
+                        help="Apply schema-aware hard mask + ForceSelectAtStart during generation")
     parser.add_argument("--rerank_dev_by_gt", action="store_true",
                         help="Dev only: choose candidate by max F1 vs ground-truth records")
     parser.add_argument("--prefer_executable_on_test", action="store_true",
                         help="Test: among k candidates, pick any executable (prefer non-empty)")
-
-    # NEW: constraints
-    parser.add_argument("--constrain_sql", action="store_true",
-                        help="Enable schema-aware constrained decoding to cut SQL errors")
-    parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
-    parser.add_argument("--length_penalty", type=float, default=0.6)
+    parser.add_argument("--repair_sql", action="store_true",
+                        help="Lightly repair SQL candidates before execution")
 
     return parser.parse_args()
 
+
+# =========================
+# Decoding helpers (batched)
+# =========================
 
 def _extract_sql_like(s: str) -> str:
     """
@@ -242,33 +269,30 @@ def _extract_sql_like(s: str) -> str:
     return s
 
 
-def _make_logits_processors(args, tokenizer):
-    if not args.constrain_sql:
-        return None
-
-    allowed = _build_allowed_token_ids(tokenizer, DB_PATH)
-    keep = set()
-    # keep eos/pad even if not in allowed (safety)
-    for tok in [tokenizer.eos_token_id, tokenizer.pad_token_id]:
-        if tok is not None:
-            keep.add(tok)
-
-    return [SchemaConstrainedSQLProcessor(allowed_ids=allowed, keep_special=keep)]
+def _make_logits_processors(args, tok, allowed_ids, keep_special):
+    procs = []
+    if args.constrain_sql:
+        procs.append(ForceSelectAtStart(tok))
+        procs.append(SchemaConstrainedSQLProcessor(allowed_ids=allowed_ids, keep_special=keep_special))
+    return LogitsProcessorList(procs) if procs else None
 
 
-def _batch_generate_k(model, tok, enc_ids, enc_mask, gen_cfg, k, logits_processors=None):
+def _batch_generate_k(model, tok, enc_ids, enc_mask, gen_cfg, k, logits_processors=None, stop_on_semi=False):
     """
     Generate k candidates per example for the whole batch in ONE call.
     Returns list[list[str]] of length batch_size; each inner list has k decoded SQL strings.
     """
+    stopping = None
+    if stop_on_semi:
+        stopping = [StopOnSemicolon(tok)]
     out = model.generate(
         input_ids=enc_ids,
         attention_mask=enc_mask,
         generation_config=gen_cfg,
+        logits_processor=logits_processors,
+        stopping_criteria=stopping,
         return_dict_in_generate=True,
         output_scores=False,
-        logits_processor=logits_processors,
-        stopping_criteria=StoppingCriteriaList([StopOnSemicolon(tok)]),
     )
     seqs = out.sequences  # [batch*k, L]
     B = enc_ids.size(0)
@@ -283,6 +307,10 @@ def _batch_generate_k(model, tok, enc_ids, enc_mask, gen_cfg, k, logits_processo
         all_sqls.append(cand_strs)
     return all_sqls
 
+
+# =========
+# Training
+# =========
 
 def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     best_f1 = -1.0
@@ -309,8 +337,8 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(
             args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path
         )
-        print(f"[{model_type}][dev] Epoch {epoch}: Dev loss {eval_loss:.4f}, "
-              f"Record F1 {record_f1:.4f}, Record EM {record_em:.4f}, SQL EM {sql_em:.4f}")
+        print(f"[{model_type}][dev] Epoch {epoch}: Dev loss {eval_loss:.4f}, Record F1 {record_f1:.4f}, "
+              f"Record EM {record_em:.4f}, SQL EM {sql_em:.4f}")
         print(f"[{model_type}][dev] Epoch {epoch}: {error_rate*100:.2f}% SQL errors")
 
         if args.use_wandb:
@@ -376,17 +404,12 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
     return total_loss / max(1, total_tokens)
 
 
-def _make_gen_config(args, tok, fast=False):
-    if fast:
-        k = max(1, args.train_eval_k)
-        beams = max(1, args.train_eval_beams)
-        max_new = max(8, args.train_eval_max_new)
-    else:
-        k = max(1, args.num_return_sequences)
-        beams = max(1, args.gen_beam_size)
-        max_new = max(8, args.gen_max_new_tokens)
+# =========
+# Evaluate
+# =========
 
-    gen_cfg = GenerationConfig(
+def _make_gen_config(tok, beams, k, max_new, length_penalty, no_repeat_ngram_size):
+    return GenerationConfig(
         max_new_tokens=max_new,
         num_beams=beams,
         num_return_sequences=k,
@@ -394,12 +417,9 @@ def _make_gen_config(args, tok, fast=False):
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         decoder_start_token_id=tok.pad_token_id,
-        no_repeat_ngram_size=max(0, args.no_repeat_ngram_size),
-        length_penalty=args.length_penalty,
-        early_stopping=True,
+        length_penalty=length_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
-    return gen_cfg, k
-
 
 def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
     """
@@ -429,10 +449,23 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
 
     # 2) Generation params (fast vs full)
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
-    gen_cfg, k = _make_gen_config(args, tok, fast=args.fast_eval)
+    if args.fast_eval:
+        k = max(1, args.train_eval_k)
+        beams = max(1, args.train_eval_beams)
+        max_new = max(8, args.train_eval_max_new)
+    else:
+        k = max(1, args.num_return_sequences)
+        beams = max(1, args.gen_beam_size)
+        max_new = max(8, args.gen_max_new_tokens)
 
-    # 3) Logits processors (constraints)
-    logits_processors = _make_logits_processors(args, tok)
+    gen_cfg = _make_gen_config(
+        tok, beams, k, max_new, args.length_penalty, args.no_repeat_ngram_size
+    )
+
+    # 3) Allowed ids + processors
+    keep_special = {i for i in [tok.eos_token_id, tok.pad_token_id] if i is not None}
+    allowed_ids, known_tables = _build_allowed_token_ids(tok, DB_PATH)
+    logits_procs = _make_logits_processors(args, tok, allowed_ids, keep_special)
 
     # 4) Load GT records once
     import pickle
@@ -464,12 +497,16 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
 
             # ONE generate call for the whole batch
             all_cands = _batch_generate_k(
-                model, tok, encoder_input, encoder_mask, gen_cfg, k, logits_processors=logits_processors
+                model, tok, encoder_input, encoder_mask, gen_cfg, k,
+                logits_processors=logits_procs, stop_on_semi=True
             )
 
             # Rerank per example
             for i in range(B):
                 cands = all_cands[i]  # k SQL strings
+                if args.repair_sql:
+                    cands = [_repair_sql(q, known_tables) for q in cands]
+
                 # Execute this example's k candidates in ONE call
                 recs, errs = compute_records(cands)
 
@@ -533,14 +570,25 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     return ce_loss, record_f1, record_em, sql_em, error_rate
 
 
+# =========
+# Testing
+# =========
+
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     """
     Test: batch-generate k candidates per example + prefer executable (and non-empty) candidate.
     """
     model.eval()
     tok = T5TokenizerFast.from_pretrained("google-t5/t5-small")
-    gen_cfg, k = _make_gen_config(args, tok, fast=False)
-    logits_processors = _make_logits_processors(args, tok)
+    k = max(1, args.num_return_sequences)
+    beams = max(1, args.gen_beam_size)
+    max_new = max(8, args.gen_max_new_tokens)
+
+    gen_cfg = _make_gen_config(tok, beams, k, max_new, args.length_penalty, args.no_repeat_ngram_size)
+
+    keep_special = {i for i in [tok.eos_token_id, tok.pad_token_id] if i is not None}
+    allowed_ids, known_tables = _build_allowed_token_ids(tok, DB_PATH)
+    logits_procs = _make_logits_processors(args, tok, allowed_ids, keep_special)
 
     from utils import compute_records
 
@@ -552,11 +600,14 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
             B = encoder_input.size(0)
 
             all_cands = _batch_generate_k(
-                model, tok, encoder_input, encoder_mask, gen_cfg, k, logits_processors=logits_processors
+                model, tok, encoder_input, encoder_mask, gen_cfg, k,
+                logits_processors=logits_procs, stop_on_semi=True
             )
 
             for i in range(B):
                 cands = all_cands[i]
+                if args.repair_sql:
+                    cands = [_repair_sql(q, known_tables) for q in cands]
                 recs, errs = compute_records(cands)
 
                 picked = None
@@ -581,6 +632,10 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     save_queries_and_records(sql_preds, model_sql_path, model_record_path)
 
 
+# =====
+# Main
+# =====
+
 def main():
     args = get_args()
     if args.use_wandb:
@@ -592,7 +647,8 @@ def main():
     optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
 
     # Train (between-epoch eval can be sped up with --fast_eval)
-    train(args, model, train_loader, dev_loader, optimizer, scheduler)
+    if args.max_n_epochs > 0:
+        train(args, model, train_loader, dev_loader, optimizer, scheduler)
 
     # Evaluate best on dev and produce test submission files (full params, NOT fast_eval)
     model = load_model_from_checkpoint(args, best=True)
@@ -613,8 +669,7 @@ def main():
     )
     args.fast_eval = was_fast
 
-    print(f"Dev set results: Loss: {dev_loss:.4f}, Record F1: {dev_record_f1:.4f}, "
-          f"Record EM: {dev_record_em:.4f}, SQL EM: {dev_sql_em:.4f}")
+    print(f"Dev set results: Loss: {dev_loss:.4f}, Record F1: {dev_record_f1:.4f}, Record EM: {dev_record_em:.4f}, SQL EM: {dev_sql_em:.4f}")
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
     # Test generation + records => SUBMISSION FILES
