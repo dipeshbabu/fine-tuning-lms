@@ -11,9 +11,7 @@ from typing import List, Any
 
 import torch
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(SCRIPT_DIR, "data", "flight_database.db")
-
+DB_PATH = 'data/flight_database.db'
 
 def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None, model_query_records: str = None):
     '''
@@ -31,15 +29,13 @@ def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None,
                                      returned by the model-generated SQL queries.
     '''
     gt_qs, gt_records, _ = load_queries_and_records(gt_path, gt_query_records)
-    model_qs, model_records, model_error_msgs = load_queries_and_records(
-        model_path, model_query_records)
+    model_qs, model_records, model_error_msgs = load_queries_and_records(model_path, model_query_records)
 
     sql_em = compute_sql_exact_match(gt_qs, model_qs)
     record_em = compute_record_exact_match(gt_records, model_records)
     record_f1 = compute_record_F1(gt_records, model_records)
 
     return sql_em, record_em, record_f1, model_error_msgs
-
 
 def load_queries_and_records(sql_path: str, record_path: str):
     '''
@@ -61,7 +57,6 @@ def load_queries_and_records(sql_path: str, record_path: str):
 
     return read_qs, records, error_msgs
 
-
 def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path: str):
     '''
     Helper function to save model generated SQL queries and their associated records
@@ -78,50 +73,44 @@ def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path:
             f.write(f'{query}\n')
 
     # Next compute and save records
-    records, error_msgs = compute_records(sql_queries)
+    records, error_msgs = compute_records(sql_queries)    
     with open(record_path, 'wb') as f:
         pickle.dump((records, error_msgs), f)
-
 
 def read_queries(sql_path: str):
     with open(sql_path, 'r') as f:
         qs = [q.strip() for q in f.readlines()]
     return qs
 
-
 def compute_records(processed_qs: List[str]):
-    """
-    Compute records for each SQL query with a shorter overall timeout,
-    and fast-skip any query that doesn't start with SELECT.
-    """
-    num_threads = 8
-    timeout_secs = 30  # was 120 — shorten to avoid long hangs
+    '''
+    Helper function for computing the records associated with each SQL query in the
+    input list. You may change the number of threads or the timeout variable (in seconds)
+    based on your computational constraints.
+
+    Input:
+        * processed_qs (List[str]): The list of SQL queries to execute
+    '''
+    num_threads = 10
+    timeout_secs = 120
 
     pool = ThreadPoolExecutor(num_threads)
     futures = []
-
     for i, query in enumerate(processed_qs):
-        q = (query or "").strip()
-        # Fast-skip: only try the DB for reasonably valid-looking SELECTs
-        if not re.match(r"(?is)^\s*select\b", q):
-            # immediate "error" result, no DB call
-            futures.append(pool.submit(lambda idx=i: (
-                idx, [], "Skipped: not a SELECT")))
-        else:
-            futures.append(pool.submit(compute_record, i, q))
-
+        futures.append(pool.submit(compute_record, i, query))
+        
     rec_dict = {}
     try:
         for x in tqdm(as_completed(futures, timeout=timeout_secs)):
             query_id, rec, error_msg = x.result()
             rec_dict[query_id] = (rec, error_msg)
-    except Exception:
-        # Cancel remaining to return promptly
+    except:
         for future in futures:
             if not future.done():
                 future.cancel()
-
-    recs, error_msgs = [], []
+            
+    recs = []
+    error_msgs = []
     for i in range(len(processed_qs)):
         if i in rec_dict:
             rec, error_msg = rec_dict[i]
@@ -130,28 +119,23 @@ def compute_records(processed_qs: List[str]):
         else:
             recs.append([])
             error_msgs.append("Query timed out")
-
+            
     return recs, error_msgs
 
-
 def compute_record(query_id, query):
-    # Each query uses its own short-lived connection
-    conn = sqlite3.connect(DB_PATH, timeout=3.0)  # small busy timeout
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+
     try:
-        # Guard: reject multi-statements and semicolons beyond the first
-        if query.count(";") > 1:
-            raise ValueError("Multiple statements not allowed")
         cursor.execute(query)
         rec = cursor.fetchall()
         error_msg = ""
     except Exception as e:
         rec = []
         error_msg = f"{type(e).__name__}: {e}"
-    finally:
-        conn.close()
-    return query_id, rec, error_msg
 
+    conn.close()
+    return query_id, rec, error_msg
 
 def compute_sql_exact_match(gt_qs: List[str], model_qs: List[str]):
     '''
@@ -165,7 +149,6 @@ def compute_sql_exact_match(gt_qs: List[str], model_qs: List[str]):
         ems += 1 if gt_q == model_q else 0
     return ems / total
 
-
 def compute_record_exact_match(gt_records: List[Any], model_records: List[Any]):
     '''
     Helper function to compute exact match between records
@@ -178,7 +161,6 @@ def compute_record_exact_match(gt_records: List[Any], model_records: List[Any]):
         ems += 1 if set(gt_rec) == set(model_rec) else 0
     return ems / total
 
-
 def compute_record_F1(gt_records: List[Any], model_records: List[Any]):
     '''
     Helper function to compute F1 between records
@@ -187,27 +169,24 @@ def compute_record_F1(gt_records: List[Any], model_records: List[Any]):
     F1s = []
     for gt_rec, model_rec in zip(gt_records, model_records):
         gt_set = set(gt_rec)
-        model_set = set(model_rec)
+        model_set = set(model_rec)        
 
         precision_total = len(model_set)
         if precision_total == 0:
             precision = 1
         else:
-            precision = len(
-                [rec for rec in model_set if rec in gt_set]) / precision_total
-
-        recall_total = len(gt_set)
+            precision = len([rec for rec in model_set if rec in gt_set]) / precision_total
+    
+        recall_total = len(gt_set)    
         if recall_total == 0:
             recall = 1
         else:
-            recall = len(
-                [rec for rec in gt_set if rec in model_set]) / recall_total
+            recall = len([rec for rec in gt_set if rec in model_set]) / recall_total
 
         F1 = 2 * precision * recall / (precision + recall + 1e-8)
         F1s.append(F1)
 
     return np.mean(F1s)
-
 
 def set_random_seeds(seed_value=42):
     '''
@@ -215,29 +194,9 @@ def set_random_seeds(seed_value=42):
     '''
     random.seed(seed_value)
     np.random.seed(seed_value)
-
+    
     torch.manual_seed(seed_value)
     torch.cuda.manual_seed(seed_value)
     torch.cuda.manual_seed_all(seed_value)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-def ensure_dev_ground_truth_records(data_dir: str, records_dir: str):
-    """
-    Build ground_truth_dev.pkl in `records_dir` from dev.sql in `data_dir` if missing.
-    Keeps your old format: pickle of (records, error_msgs).
-    """
-    os.makedirs(records_dir, exist_ok=True)
-    dev_sql_path = os.path.join(data_dir, "dev.sql")
-    gt_path = os.path.join(records_dir, "ground_truth_dev.pkl")
-    if not os.path.exists(dev_sql_path):
-        raise FileNotFoundError(f"Expected {dev_sql_path}")
-    if os.path.exists(gt_path):
-        return gt_path
-
-    qs = read_queries(dev_sql_path)
-    recs, errs = compute_records(qs)
-    with open(gt_path, "wb") as f:
-        pickle.dump((recs, errs), f)
-    return gt_path
