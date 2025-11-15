@@ -3,21 +3,15 @@ import os
 import torch
 
 import transformers
-from transformers import T5TokenizerFast, T5ForConditionalGeneration, T5Config, AutoConfig
+from transformers import T5ForConditionalGeneration, T5Config
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 import wandb
 
-DEVICE = torch.device(
-    'cuda') if torch.cuda.is_available() else torch.device('cpu')
-
+DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 def setup_wandb(args):
     # Implement this if you wish to use wandb in your experiments
-    # Minimal safe setup
-    if getattr(args, "use_wandb", False):
-        wandb.init(project="t5-text2sql",
-                   name=args.experiment_name or "experiment", config=vars(args))
-
+    pass
 
 def initialize_model(args):
     '''
@@ -27,14 +21,17 @@ def initialize_model(args):
     from scratch.
     '''
     if args.finetune:
-        model = T5ForConditionalGeneration.from_pretrained(
-            "google-t5/t5-small")
+        # Load pretrained T5-small model for finetuning
+        print("Initializing model for finetuning from 'google-t5/t5-small' checkpoint")
+        model = T5ForConditionalGeneration.from_pretrained('google-t5/t5-small')
     else:
-        cfg = T5Config.from_pretrained("google-t5/t5-small")
-        model = T5ForConditionalGeneration(cfg)
-    model.to(DEVICE)
+        # Initialize model from scratch with T5-small config
+        print("Initializing model from scratch with 'google-t5/t5-small' config")
+        config = T5Config.from_pretrained('google-t5/t5-small')
+        model = T5ForConditionalGeneration(config)
+    
+    model = model.to(DEVICE)
     return model
-
 
 def mkdir(dirpath):
     if not os.path.exists(dirpath):
@@ -43,68 +40,56 @@ def mkdir(dirpath):
         except FileExistsError:
             pass
 
-
 def save_model(checkpoint_dir, model, best):
     # Save model checkpoint to be able to load the model later
-    sub = "best" if best else "last"
-    out_dir = os.path.join(checkpoint_dir, sub)
-    mkdir(out_dir)
-    model.save_pretrained(out_dir)
+    mkdir(checkpoint_dir)
     
+    if best:
+        save_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        print(f"Saving best model to {save_path}")
+    else:
+        save_path = os.path.join(checkpoint_dir, 'last_model.pt')
+    
+    # Save the model state dict
+    torch.save({
+        'model_state_dict': model.state_dict(),
+    }, save_path)
 
-def load_model_from_checkpoint(args, best: bool = True, fallback_model=None):
-    """
-    Load a T5 model from a local checkpoint directory that was saved by `save_model`.
-    If the checkpoint directory does not exist or is invalid, return `fallback_model`
-    if provided; otherwise re-raise the exception.
-
-    This function only loads from LOCAL DISK paths. It does NOT try to fetch from HF Hub.
-    """
-    # Construct the local path exactly like `save_model` wrote it
-    model_type = "ft" if getattr(args, "finetune", False) else "scr"
-    experiment_name = getattr(args, "experiment_name", "dev")
-    root = getattr(args, "checkpoint_dir", None)
-
-    if root is None:
-        # Default to the same layout used in train_t5.py
-        from pathlib import Path
-        script_dir = Path(__file__).resolve().parent
-        root = script_dir / "checkpoints" / f"{model_type}_experiments" / experiment_name
-
-    load_dir = os.path.join(str(root), "best" if best else "last")
-
-    try:
-        if not os.path.isdir(load_dir):
-            raise FileNotFoundError(f"Checkpoint directory not found: {load_dir}")
-
-        # Force local loading: pass a config if present, otherwise let transformers infer it.
-        if os.path.isfile(os.path.join(load_dir, "config.json")):
-            config = AutoConfig.from_pretrained(load_dir)
-            model = T5ForConditionalGeneration.from_pretrained(load_dir, config=config)
+def load_model_from_checkpoint(args, best):
+    # Load model from a checkpoint
+    model_type = 'ft' if args.finetune else 'scr'
+    checkpoint_dir = os.path.join('checkpoints', f'{model_type}_experiments', args.experiment_name)
+    
+    if best:
+        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        # Fallback to last model if best doesn't exist
+        if not os.path.exists(checkpoint_path):
+            print(f"Warning: Best model not found at {checkpoint_path}, loading last model instead")
+            checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
         else:
-            model = T5ForConditionalGeneration.from_pretrained(load_dir)
-
-        return model
-    except Exception as e:
-        if fallback_model is not None:
-            print(f"[WARN] Could not load checkpoint at '{load_dir}': {e}\n"
-                  f"[WARN] Falling back to the in-memory model.")
-            return fallback_model
-        # No fallback provided: bubble up
-        raise
-
+            print(f"Loading best model from {checkpoint_path}")
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
+        print(f"Loading last model from {checkpoint_path}")
+    
+    # Initialize a new model with the same configuration
+    model = initialize_model(args)
+    
+    # Load the saved state dict
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    model = model.to(DEVICE)
+    return model
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):
     optimizer = initialize_optimizer(args, model)
     scheduler = initialize_scheduler(args, optimizer, epoch_length)
     return optimizer, scheduler
 
-
 def initialize_optimizer(args, model):
-    decay_parameters = get_parameter_names(
-        model, transformers.pytorch_utils.ALL_LAYERNORM_LAYERS)
-    decay_parameters = [
-        name for name in decay_parameters if "bias" not in name]
+    decay_parameters = get_parameter_names(model, transformers.pytorch_utils.ALL_LAYERNORM_LAYERS)
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
     optimizer_grouped_parameters = [
         {
             "params": [
@@ -128,8 +113,7 @@ def initialize_optimizer(args, model):
         pass
 
     return optimizer
-
-
+        
 def initialize_scheduler(args, optimizer, epoch_length):
     num_training_steps = epoch_length * args.max_n_epochs
     num_warmup_steps = epoch_length * args.num_warmup_epochs
@@ -143,7 +127,6 @@ def initialize_scheduler(args, optimizer, epoch_length):
     else:
         raise NotImplementedError
 
-
 def get_parameter_names(model, forbidden_layer_types):
     result = []
     for name, child in model.named_children():
@@ -155,10 +138,3 @@ def get_parameter_names(model, forbidden_layer_types):
     # Add model specific parameters (defined with nn.Parameter) since they are not in any child.
     result += list(model._parameters.keys())
     return result
-
-
-def get_tokenizer():
-    """
-    Factory to keep tokenizer creation in one place.
-    """
-    return T5TokenizerFast.from_pretrained("google-t5/t5-small")
