@@ -3,7 +3,7 @@ import os
 import torch
 
 import transformers
-from transformers import T5TokenizerFast, T5ForConditionalGeneration, T5Config
+from transformers import T5TokenizerFast, T5ForConditionalGeneration, T5Config, AutoConfig
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 import wandb
 
@@ -50,18 +50,48 @@ def save_model(checkpoint_dir, model, best):
     out_dir = os.path.join(checkpoint_dir, sub)
     mkdir(out_dir)
     model.save_pretrained(out_dir)
+    
 
+def load_model_from_checkpoint(args, best: bool = True, fallback_model=None):
+    """
+    Load a T5 model from a local checkpoint directory that was saved by `save_model`.
+    If the checkpoint directory does not exist or is invalid, return `fallback_model`
+    if provided; otherwise re-raise the exception.
 
-def load_model_from_checkpoint(args, best):
-    # Load model from a checkpoint
-    model_type = 'ft' if args.finetune else 'scr'
-    ckpt_dir = getattr(args, "checkpoint_dir", os.path.join(
-        "checkpoints", f"{model_type}_experiments", args.experiment_name))
-    sub = "best" if best else "last"
-    load_dir = os.path.join(ckpt_dir, sub)
-    model = T5ForConditionalGeneration.from_pretrained(load_dir)
-    model.to(DEVICE)
-    return model
+    This function only loads from LOCAL DISK paths. It does NOT try to fetch from HF Hub.
+    """
+    # Construct the local path exactly like `save_model` wrote it
+    model_type = "ft" if getattr(args, "finetune", False) else "scr"
+    experiment_name = getattr(args, "experiment_name", "dev")
+    root = getattr(args, "checkpoint_dir", None)
+
+    if root is None:
+        # Default to the same layout used in train_t5.py
+        from pathlib import Path
+        script_dir = Path(__file__).resolve().parent
+        root = script_dir / "checkpoints" / f"{model_type}_experiments" / experiment_name
+
+    load_dir = os.path.join(str(root), "best" if best else "last")
+
+    try:
+        if not os.path.isdir(load_dir):
+            raise FileNotFoundError(f"Checkpoint directory not found: {load_dir}")
+
+        # Force local loading: pass a config if present, otherwise let transformers infer it.
+        if os.path.isfile(os.path.join(load_dir, "config.json")):
+            config = AutoConfig.from_pretrained(load_dir)
+            model = T5ForConditionalGeneration.from_pretrained(load_dir, config=config)
+        else:
+            model = T5ForConditionalGeneration.from_pretrained(load_dir)
+
+        return model
+    except Exception as e:
+        if fallback_model is not None:
+            print(f"[WARN] Could not load checkpoint at '{load_dir}': {e}\n"
+                  f"[WARN] Falling back to the in-memory model.")
+            return fallback_model
+        # No fallback provided: bubble up
+        raise
 
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):
