@@ -3,7 +3,7 @@ import os
 import torch
 
 import transformers
-from transformers import T5ForConditionalGeneration, T5Config
+from transformers import T5TokenizerFast, T5ForConditionalGeneration, T5Config
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 import wandb
 
@@ -125,3 +125,10 @@ def get_parameter_names(model, forbidden_layer_types):
     # Add model specific parameters (defined with nn.Parameter) since they are not in any child.
     result += list(model._parameters.keys())
     return result
+
+
+def get_tokenizer():
+    """
+    Factory to keep tokenizer creation in one place.
+    """
+    return T5TokenizerFast.from_pretrained("google-t5/t5-small")
