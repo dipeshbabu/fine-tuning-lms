@@ -584,8 +584,8 @@ def main():
     test_sql_preds = [c[0] for c in test_candidates]
 
     basename = f"t5_ft_{args.experiment_name}_test"
-    sql_path = os.path.join(RESULTS_DIR, f"{basename}.sql}")
-    rec_path = os.path.join(RECORDS_DIR, f"{basename}.pkl}")
+    sql_path = os.path.join(RESULTS_DIR, f"{basename}.sql")
+    rec_path = os.path.join(RECORDS_DIR, f"{basename}.pkl")
 
     # Save queries + records using the provided helper
     save_queries_and_records(test_sql_preds, sql_path, rec_path)
