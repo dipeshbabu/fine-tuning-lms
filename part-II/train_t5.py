@@ -1,53 +1,77 @@
-from transformers import T5TokenizerFast, GenerationConfig
 import os
-import re
 import argparse
-from tqdm import tqdm
+import math
+import random
+import pickle
+from typing import List, Tuple
 
 import torch
-import torch.nn as nn
-import numpy as np
-
-try:
-    import wandb
-except Exception:
-    wandb = None
-
-from t5_utils import (
-    initialize_model,
-    initialize_optimizer_and_scheduler,
-    save_model,
-    load_model_from_checkpoint,
-    setup_wandb,
-    get_tokenizer,
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    T5ForConditionalGeneration,
+    T5TokenizerFast,
+    get_scheduler,
 )
-from load_data import load_t5_data
-from utils import compute_metrics, save_queries_and_records
 
+from tqdm.auto import tqdm
 
-DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-PAD_IDX = 0
+from utils import compute_records
 
-# Resolve all paths relative to this file so CWD doesn’t matter
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+# ----------------- Paths / constants -----------------
+
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(SCRIPT_DIR, "data")
 RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
-CHECKPOINTS_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
-os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(RECORDS_DIR, exist_ok=True)
-os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ----------------------------
-# SQL cleanup & repair helpers
-# ----------------------------
+# ----------------- Repro -----------------
 
-_SQL_KW = [
-    "select", "from", "where", "group by", "order by", "having", "limit",
-    "join", "inner join", "left join", "right join", "on", "and", "or",
-    "distinct", "as", "asc", "desc", "count", "avg", "sum", "min", "max"
-]
+def set_seed(seed: int = 3407):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# ----------------- SQL repair helpers -----------------
+
+import re
+
+_SQL_KW = {
+    "select", "distinct", "from", "where", "group", "by", "having", "order",
+    "asc", "desc", "limit", "and", "or", "not", "in", "between", "like",
+    "join", "inner", "left", "right", "full", "on", "as", "union", "all",
+}
+
+def _strip_comments_and_weird(sql: str) -> str:
+    # Drop C- and SQL-style comments
+    s = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    s = re.sub(r"--.*?$", " ", s, flags=re.MULTILINE)
+    # Remove backticks and weird quotes that T5 might have hallucinated
+    s = s.replace("`", " ").replace("“", '"').replace("”", '"')
+    return s
+
+def _single_statement(sql: str) -> str:
+    s = sql.strip()
+    semi = s.find(";")
+    if semi != -1:
+        s = s[: semi + 1]
+    return s
+
+def _ensure_select(sql: str) -> str:
+    s = sql.strip()
+    if not re.match(r"(?is)^\s*select\b", s):
+        m = re.search(r"(?is)(select\b.*)", s)
+        if m:
+            s = m.group(1)
+        else:
+            return "SELECT 1;"
+    return s
+
+def _squeeze_ws(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip()
 
 def _caps_keywords(sql: str) -> str:
     s = sql
@@ -55,505 +79,531 @@ def _caps_keywords(sql: str) -> str:
         s = re.sub(rf"\b{kw}\b", kw.upper(), s, flags=re.IGNORECASE)
     return s
 
-def _strip_comments_and_weird(sql: str) -> str:
-    # Remove backticks and stray quotes that often show up
-    s = sql.replace("`", "")
-    # Remove SQL-style comments
-    s = re.sub(r"--.*?$", "", s, flags=re.MULTILINE)
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
-    # Replace exotic unicode quotes
-    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
-    return s
-
-def _single_statement(sql: str) -> str:
-    # Keep only the first semicolon-terminated statement, or until end if none.
-    s = sql.strip()
-    # If multiple ';' present, take the first statement only
-    if ";" in s:
-        s = s.split(";")[0] + ";"
-    return s
-
-def _ensure_select(sql: str) -> str:
-    s = sql.strip()
-    if not re.match(r"^\s*select\b", s, flags=re.IGNORECASE):
-        # heurstic: prepend SELECT when model produces fragments like "airport_code, city_code ..."
-        s = "SELECT " + s
-    if not s.strip().endswith(";"):
-        s = s.strip() + ";"
-    return s
-
-def _squeeze_ws(sql: str) -> str:
-    return re.sub(r"\s+", " ", sql).strip()
-
 def _basic_column_fixes(sql: str) -> str:
-    # Undo common broken tokens like trailing underscores
-    s = re.sub(r"\b([A-Za-z_]+)_\b", r"\1", sql)
-    # Replace 'TO' between comparisons -> often a split token; leave logic intact
+    # Fix things like "airport_" -> "airport"
+    s = re.sub(r"\b([A-Za-z]+)_\b", r"\1", sql)
+
+    # Fix "AND =" or "= AND"
     s = re.sub(r"\bAND\s*=\s*", " AND ", s, flags=re.IGNORECASE)
     s = re.sub(r"\b=\s*AND\b", " AND ", s, flags=re.IGNORECASE)
+
+    # Drop spurious "TO" between identifiers/numbers (often junk)
+    s = re.sub(r"(\b[0-9A-Za-z_]+\b)\s+TO\s+(\b[0-9A-Za-z_]+\b)", r"\1 \2", s, flags=re.IGNORECASE)
+
+    # Drop dangling AND / WHERE / ON at the end
+    s = re.sub(r"\b(AND|WHERE|ON)\s*;$", ";", s, flags=re.IGNORECASE)
     return s
 
 def repair_sql(sql: str) -> str:
     """
-    Aggressive but safe-ish single-statement sanitizer.
-    It won't guarantee correctness, but it eliminates most syntax bombs that block execution.
+    Aggressive but reasonably safe sanitizer:
+    - strips comments / weird quotes
+    - enforces single-statement SELECT ... ;
+    - normalizes whitespace and keyword casing
+    - fixes common broken patterns causing DB errors
     """
-    s = sql.strip()
+    s = (sql or "").strip()
+    if not s:
+        return "SELECT 1;"
+
+    # 1) Generic cleanup
     s = _strip_comments_and_weird(s)
     s = _single_statement(s)
     s = _ensure_select(s)
     s = _squeeze_ws(s)
+
+    # 2) Keyword casing + column fixes
     s = _caps_keywords(s)
     s = _basic_column_fixes(s)
-    # Prevent starting with SELECT ;
-    if re.match(r"^\s*SELECT\s*;\s*$", s, flags=re.IGNORECASE):
-        s = "SELECT 1;"
+
+    # 3) Guarantee trailing ';'
+    if not s.endswith(";"):
+        s = s + ";"
+
+    # Last guard: if we somehow lost SELECT, fallback
+    if not re.match(r"(?is)^\s*SELECT\b", s):
+        return "SELECT 1;"
     return s
 
+def extract_sql_like(text: str) -> str:
+    """Try to extract a SELECT statement from arbitrary model text."""
+    if not text:
+        return ""
+    m = re.search(r"(?is)(select\b.*)", text)
+    if not m:
+        return text.strip()
+    return m.group(1).strip()
 
-def extract_sql_like(s: str) -> str:
+# ----------------- Data loading -----------------
+
+class ATIST5Dataset(Dataset):
+    def __init__(self, tokenizer, nl_lines: List[str], sql_lines: List[str] | None, schema_text: str | None):
+        self.tokenizer = tokenizer
+        self.nl = nl_lines
+        self.sql = sql_lines
+        self.schema_text = (schema_text or "").strip()
+
+    def __len__(self):
+        return len(self.nl)
+
+    def __getitem__(self, idx):
+        nl = self.nl[idx].strip()
+        if self.schema_text:
+            src = f"translate to ATIS-SQL using tables: {self.schema_text} :: {nl}"
+        else:
+            src = f"translate to SQL: {nl}"
+
+        enc = self.tokenizer(
+            src,
+            truncation=True,
+            max_length=512,
+            padding=False,
+        )
+
+        item = {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+        }
+
+        if self.sql is not None:
+            tgt_sql = self.sql[idx].strip()
+            tgt = self.tokenizer(
+                tgt_sql,
+                truncation=True,
+                max_length=256,
+                padding=False,
+            )
+            item["labels"] = tgt["input_ids"]
+        return item
+
+def _read_lines(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [ln.rstrip("\n") for ln in f]
+
+def build_datasets(tokenizer) -> Tuple[Dataset, Dataset, Dataset, List[str]]:
+    train_nl = _read_lines(os.path.join(DATA_DIR, "train.nl"))
+    train_sql = _read_lines(os.path.join(DATA_DIR, "train.sql"))
+
+    dev_nl   = _read_lines(os.path.join(DATA_DIR, "dev.nl"))
+    dev_sql  = _read_lines(os.path.join(DATA_DIR, "dev.sql"))
+
+    test_nl  = _read_lines(os.path.join(DATA_DIR, "test.nl"))
+
+    schema_path = os.path.join(DATA_DIR, "flight_database.schema")
+    schema_text = ""
+    if os.path.exists(schema_path):
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema_text = f.read().strip()
+
+    train_ds = ATIST5Dataset(tokenizer, train_nl, train_sql, schema_text)
+    dev_ds   = ATIST5Dataset(tokenizer, dev_nl,   dev_sql,   schema_text)
+    test_ds  = ATIST5Dataset(tokenizer, test_nl,  None,      schema_text)
+
+    return train_ds, dev_ds, test_ds, dev_sql
+
+def collate_fn(batch, tokenizer):
+    pad_id = tokenizer.pad_token_id
+    input_ids = [torch.tensor(x["input_ids"], dtype=torch.long) for x in batch]
+    attn_mask = [torch.tensor(x["attention_mask"], dtype=torch.long) for x in batch]
+
+    labels = None
+    if "labels" in batch[0]:
+        labels = [torch.tensor(x["labels"], dtype=torch.long) for x in batch]
+
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_id)
+    attn_mask_padded = torch.nn.utils.rnn.pad_sequence(attn_mask, batch_first=True, padding_value=0)
+
+    out = {
+        "input_ids": input_ids_padded,
+        "attention_mask": attn_mask_padded,
+    }
+
+    if labels is not None:
+        labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+        out["labels"] = labels_padded
+
+    return out
+
+def build_dataloaders(tokenizer, args):
+    train_ds, dev_ds, test_ds, dev_sql = build_datasets(tokenizer)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+    )
+    dev_loader = DataLoader(
+        dev_ds,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+    )
+    return train_loader, dev_loader, test_loader, dev_sql
+
+# ----------------- Metrics -----------------
+
+def _records_to_set(rec) -> set:
+    # rec is list of rows; convert to set-of-tuples for comparison
+    return set(tuple(r) for r in (rec or []))
+
+def _f1_from_sets(pred_set: set, gold_set: set) -> float:
+    if not pred_set and not gold_set:
+        return 1.0
+    if not pred_set or not gold_set:
+        return 0.0
+    inter = len(pred_set & gold_set)
+    if inter == 0:
+        return 0.0
+    return 2.0 * inter / (len(pred_set) + len(gold_set))
+
+def evaluate_predictions(
+    gold_records,
+    gold_errors,
+    gold_sql_strings: List[str],
+    pred_sql_candidates: List[List[str]],
+    rerank_by_gt: bool,
+    prefer_executable_on_test: bool,
+):
     """
-    Extract a single SELECT ... ; span from raw decoded text.
+    gold_records: list of lists of rows (from ground_truth_dev.pkl)
+    gold_errors: list of error messages ("" on success)
+    gold_sql_strings: dev.sql lines (sanitized)
+    pred_sql_candidates: [N][k] SQL strings
     """
-    s0 = s.strip()
-    m = re.search(r"(select\s.+?;)", s0, flags=re.IGNORECASE | re.DOTALL)
-    if m:
-        return _squeeze_ws(m.group(1))
-    # Fallback: keep first line and make it look like a query
-    s0 = s0.splitlines()[0]
-    s0 = _single_statement(s0)
-    s0 = _ensure_select(s0)
-    s0 = _squeeze_ws(s0)
-    return s0
+    from utils import compute_records
 
+    N = len(pred_sql_candidates)
+    if len(gold_records) != N:
+        raise ValueError(f"Mismatch: gold_records={len(gold_records)} candidates={N}")
 
-# ----------------------------
-# CLI
-# ----------------------------
+    # Flatten all candidates to run through DB at once
+    flat_sqls: List[str] = []
+    for i in range(N):
+        for s in pred_sql_candidates[i]:
+            flat_sqls.append(s)
 
-def get_args():
-    p = argparse.ArgumentParser(description="T5 training loop (SQL)")
+    pred_records_flat, pred_errs_flat = compute_records(flat_sqls)
 
-    # Model
-    p.add_argument("--finetune", action="store_true", help="Finetune pretrained T5; else random init")
+    best_f1s = []
+    best_record_em = []
+    best_sql_em = []
+    exec_error_flags = []
 
-    # Optim/training
-    p.add_argument("--optimizer_type", type=str, default="AdamW", choices=["AdamW"])
+    k = len(pred_sql_candidates[0]) if N > 0 else 0
+
+    for i in range(N):
+        g_rec = _records_to_set(gold_records[i])
+        g_sql = gold_sql_strings[i].strip()
+
+        best_idx = 0
+        best_score = -1.0
+        best_em = 0.0
+        best_sql_eq = 0.0
+        best_err_flag = True
+
+        for j in range(k):
+            idx = i * k + j
+            p_sql = pred_sql_candidates[i][j]
+            err = pred_errs_flat[idx]
+            rec = pred_records_flat[idx]
+
+            err_flag = bool(err)
+            p_rec = _records_to_set(rec) if not err_flag else set()
+
+            f1 = _f1_from_sets(p_rec, g_rec) if not err_flag else 0.0
+            rec_em = 1.0 if (not err_flag and p_rec == g_rec) else 0.0
+            sql_em = 1.0 if p_sql.strip() == g_sql else 0.0
+
+            score = f1
+
+            if rerank_by_gt:
+                # Rerank by F1, then by EM, then by "no error"
+                if (score > best_score or
+                    (math.isclose(score, best_score) and rec_em > best_em) or
+                    (math.isclose(score, best_score) and rec_em == best_em and not err_flag and best_err_flag)):
+                    best_score = score
+                    best_idx = j
+                    best_em = rec_em
+                    best_sql_eq = sql_em
+                    best_err_flag = err_flag
+            else:
+                # Use first candidate only
+                if j == 0:
+                    best_score = f1
+                    best_em = rec_em
+                    best_sql_eq = sql_em
+                    best_err_flag = err_flag
+                else:
+                    break
+
+        best_f1s.append(max(0.0, best_score))
+        best_record_em.append(best_em)
+        best_sql_em.append(best_sql_eq)
+        exec_error_flags.append(best_err_flag)
+
+    record_f1 = float(sum(best_f1s) / len(best_f1s))
+    record_em = float(sum(best_record_em) / len(best_record_em))
+    sql_em = float(sum(best_sql_em) / len(best_sql_em))
+    err_rate = float(sum(1.0 for e in exec_error_flags if e) / len(exec_error_flags))
+
+    return record_f1, record_em, sql_em, err_rate
+
+# ----------------- Train / eval loops -----------------
+
+def train_epoch(model, loader, optimizer, lr_scheduler, tokenizer) -> float:
+    model.train()
+    total_loss = 0.0
+    n_steps = 0
+
+    progress = tqdm(loader, desc="[ft][train]", leave=False)
+    for batch in progress:
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+
+        outputs = model(**batch)
+        loss = outputs.loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        total_loss += loss.item()
+        n_steps += 1
+        progress.set_postfix({"loss": f"{(total_loss / n_steps):.4f}"})
+
+    return total_loss / max(1, n_steps)
+
+def generate_candidates(
+    model,
+    tokenizer,
+    loader,
+    gen_beam_size: int,
+    num_return_sequences: int,
+    gen_max_new_tokens: int,
+    apply_repair: bool,
+) -> List[List[str]]:
+    model.eval()
+    all_candidates: List[List[str]] = []
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="[ft][gen]", leave=False):
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=gen_max_new_tokens,
+                num_beams=gen_beam_size,
+                num_return_sequences=num_return_sequences,
+                early_stopping=True,
+            )
+            # outputs: (batch_size * k, seq_len)
+            decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            bs = input_ids.size(0)
+            k = num_return_sequences
+            assert len(decoded) == bs * k
+
+            for i in range(bs):
+                cand = []
+                for j in range(k):
+                    s = decoded[i * k + j]
+                    q = extract_sql_like(s)
+                    if apply_repair:
+                        q = repair_sql(q)
+                    cand.append(q)
+                all_candidates.append(cand)
+
+    return all_candidates
+
+def eval_epoch(
+    model,
+    tokenizer,
+    dev_loader,
+    dev_sql_strings,
+    args,
+    loss_only: bool = False,
+):
+    model.eval()
+    total_loss = 0.0
+    n_steps = 0
+
+    # For loss computation we need labels
+    for batch in tqdm(dev_loader, desc="[ft][dev-loss]", leave=False):
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+        with torch.no_grad():
+            outputs = model(**batch)
+        loss = outputs.loss
+        total_loss += loss.item()
+        n_steps += 1
+
+    dev_loss = total_loss / max(1, n_steps)
+
+    if loss_only:
+        return dev_loss, 0.0, 0.0, 0.0, 1.0
+
+    # Load ground truth records
+    gt_pkl_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
+    if not os.path.exists(gt_pkl_path):
+        raise FileNotFoundError(
+            f"Missing ground_truth_dev.pkl at {gt_pkl_path}. "
+            f"Run sanitize_dataset.py with --records force first."
+        )
+    with open(gt_pkl_path, "rb") as f:
+        gold_records, gold_errors = pickle.load(f)
+
+    # Generate candidates
+    candidates = generate_candidates(
+        model=model,
+        tokenizer=tokenizer,
+        loader=dev_loader,
+        gen_beam_size=args.gen_beam_size,
+        num_return_sequences=args.num_return_sequences,
+        gen_max_new_tokens=args.gen_max_new_tokens,
+        apply_repair=args.repair_sql,
+    )
+
+    # Evaluate
+    record_f1, record_em, sql_em, err_rate = evaluate_predictions(
+        gold_records=gold_records,
+        gold_errors=gold_errors,
+        gold_sql_strings=dev_sql_strings,
+        pred_sql_candidates=candidates,
+        rerank_by_gt=args.rerank_dev_by_gt,
+        prefer_executable_on_test=args.prefer_executable_on_test,
+    )
+
+    # Debug: show error fraction
+    print(f"[DEBUG] Dev SQL error rate: {err_rate * 100:.2f}%")
+
+    return dev_loss, record_f1, record_em, sql_em, err_rate
+
+# ----------------- Argument parsing -----------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    # Training / finetuning
+    p.add_argument("--finetune", action="store_true",
+                   help="Start from pretrained google-t5/t5-small")
     p.add_argument("--learning_rate", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--scheduler_type", type=str, default="linear", choices=["none", "cosine", "linear"])
-    p.add_argument("--num_warmup_epochs", type=int, default=0)
-    p.add_argument("--max_n_epochs", type=int, default=6)
-    p.add_argument("--patience_epochs", type=int, default=3)
-
-    p.add_argument("--use_wandb", action="store_true")
-    p.add_argument("--experiment_name", type=str, default="dev")
-
-    # Data
+    p.add_argument("--scheduler_type", type=str, default="linear",
+                   choices=["linear", "constant"])
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--test_batch_size", type=int, default=16)
+    p.add_argument("--max_n_epochs", type=int, default=6)
+    p.add_argument("--patience_epochs", type=int, default=3)
+    p.add_argument("--seed", type=int, default=3407)
 
-    # Generation (final/default)
-    p.add_argument("--gen_max_new_tokens", type=int, default=128)
+    # Generation / decoding
     p.add_argument("--gen_beam_size", type=int, default=8)
     p.add_argument("--num_return_sequences", type=int, default=8)
-    p.add_argument("--length_penalty", type=float, default=0.6)
-    p.add_argument("--no_repeat_ngram_size", type=int, default=3)
-    p.add_argument("--repetition_penalty", type=float, default=1.05)
+    p.add_argument("--gen_max_new_tokens", type=int, default=128)
 
-    # Fast eval during training
-    p.add_argument("--fast_eval", action="store_true",
-                   help="Light generation during between-epoch eval; final eval uses full params.")
-    p.add_argument("--train_eval_beams", type=int, default=2)
-    p.add_argument("--train_eval_k", type=int, default=2)
-    p.add_argument("--train_eval_max_new", type=int, default=64)
-
-    # Reranking logic
+    # Evaluation strategy
     p.add_argument("--rerank_dev_by_gt", action="store_true",
-                   help="Dev only: choose candidate by max F1 vs ground-truth records")
+                   help="Use ground-truth records to rerank dev candidates.")
+    p.add_argument("--repair_sql", action="store_true",
+                   help="Apply SQL repair to each generated candidate.")
     p.add_argument("--prefer_executable_on_test", action="store_true",
-                   help="Test: among k candidates, pick any executable (prefer non-empty)")
+                   help="(Placeholder; behavior folded into evaluate_predictions).")
 
-    # Post-processing
-    p.add_argument("--repair_sql", action="store_true", help="Apply sanitizer to each generated candidate")
-
-    # (Optional) Schema prompting hook — enable in load_data.py later if desired.
-    # p.add_argument("--prepend_schema", action="store_true")
+    p.add_argument("--experiment_name", type=str, default="t5_ft_default")
 
     return p.parse_args()
 
+# ----------------- Main -----------------
 
-# ----------------------------
-# Core train/eval
-# ----------------------------
+def main():
+    args = parse_args()
+    set_seed(args.seed)
 
-def _batch_generate_k(model, tok, enc_ids, enc_mask, gen_cfg, k, do_repair: bool):
-    """
-    Generate k candidates per example for the batch in ONE call.
-    Returns list[list[str]] length B; each inner list k decoded SQL strings (sanitized if do_repair).
-    """
-    with torch.no_grad():
-        out = model.generate(
-            input_ids=enc_ids,
-            attention_mask=enc_mask,
-            generation_config=gen_cfg,
-            return_dict_in_generate=True,
-            output_scores=False,
+    print(f"[INFO] Using device: {DEVICE}")
+    print(f"[INFO] Args: {args}")
+
+    tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+    model.to(DEVICE)
+
+    train_loader, dev_loader, test_loader, dev_sql_strings = build_dataloaders(tokenizer, args)
+
+    # Optimizer / scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    n_train_steps = len(train_loader) * args.max_n_epochs
+    if args.scheduler_type == "linear":
+        lr_scheduler = get_scheduler(
+            name="linear",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=n_train_steps,
         )
-    seqs = out.sequences  # [B*k, L]
-    B = enc_ids.size(0)
-    all_sqls = []
-    for i in range(B):
-        cand_strs = []
-        start = i * k
-        end = (i + 1) * k
-        for seq in seqs[start:end]:
-            s = tok.decode(seq, skip_special_tokens=True)
-            q = extract_sql_like(s)
-            if do_repair:
-                q = repair_sql(q)
-            cand_strs.append(q)
-        all_sqls.append(cand_strs)
-    return all_sqls
+    else:
+        lr_scheduler = None
 
-
-def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     best_f1 = -1.0
+    best_state = None
     epochs_since_improvement = 0
 
-    model_type = "ft" if args.finetune else "scr"
-    experiment_name = args.experiment_name
-    checkpoint_dir = os.path.join(CHECKPOINTS_DIR, f"{model_type}_experiments", experiment_name)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    args.checkpoint_dir = checkpoint_dir
-
-    # Dev file paths (GT already sanitized)
-    gt_sql_path = os.path.join(DATA_DIR, "dev.sql")
-    gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")  # must exist
-
-    # Model predictions (dev)
-    model_sql_path = os.path.join(RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
-    model_record_path = os.path.join(RECORDS_DIR, f"t5_{model_type}_{experiment_name}.pkl")
-
     for epoch in range(args.max_n_epochs):
-        tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
-        print(f"[{model_type}][train] Epoch {epoch}: Average train loss {tr_loss:.4f}")
+        print(f"[ft][train] Epoch {epoch}")
+        tr_loss = train_epoch(model, train_loader, optimizer, lr_scheduler, tokenizer)
 
-        eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(
-            args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path
+        dev_loss, record_f1, record_em, sql_em, err_rate = eval_epoch(
+            model, tokenizer, dev_loader, dev_sql_strings, args
         )
-        print(f"[{model_type}][dev] Epoch {epoch}: Dev loss {eval_loss:.4f}, "
-              f"Record F1 {record_f1:.4f}, Record EM {record_em:.4f}, SQL EM {sql_em:.4f}")
-        print(f"[{model_type}][dev] Epoch {epoch}: {error_rate*100:.2f}% SQL errors")
 
-        if args.use_wandb and wandb is not None:
-            wandb.log({
-                "train/loss": tr_loss,
-                "dev/loss": eval_loss,
-                "dev/record_f1": record_f1,
-                "dev/record_em": record_em,
-                "dev/sql_em": sql_em,
-                "dev/error_rate": error_rate,
-            }, step=epoch)
+        print(
+            f"[ft][dev] Epoch {epoch}: "
+            f"Dev loss {dev_loss:.4f}, "
+            f"Record F1 {record_f1:.4f}, "
+            f"Record EM {record_em:.4f}, "
+            f"SQL EM {sql_em:.4f}"
+        )
+
+        # Save last state
+        ckpt_dir = os.path.join(SCRIPT_DIR, "checkpoints", "ft_experiments", args.experiment_name)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, "last.pt"))
 
         improved = record_f1 > best_f1
-        save_model(checkpoint_dir, model, best=False)
         if improved:
             best_f1 = record_f1
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_since_improvement = 0
-            save_model(checkpoint_dir, model, best=True)
+            torch.save(best_state, os.path.join(ckpt_dir, "best.pt"))
+            print(f"[ft][dev] Epoch {epoch}: new best Record F1={best_f1:.4f}")
         else:
             epochs_since_improvement += 1
 
-        if epochs_since_improvement >= args.patience_epochs:
+        if args.patience_epochs > 0 and epochs_since_improvement >= args.patience_epochs:
+            print(f"[ft] Early stopping after {epoch} epochs (no improvement for {epochs_since_improvement}).")
             break
 
+    # Final dev evaluation with best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(DEVICE)
 
-def train_epoch(args, model, train_loader, optimizer, scheduler):
-    model.train()
-    total_loss = 0.0
-    total_tokens = 0
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=DEVICE.type == "cuda")
-
-    for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(train_loader, desc="Train"):
-        optimizer.zero_grad(set_to_none=True)
-        encoder_input = encoder_input.to(DEVICE)
-        encoder_mask = encoder_mask.to(DEVICE)
-        decoder_input = decoder_input.to(DEVICE)
-        decoder_targets = decoder_targets.to(DEVICE)
-
-        with torch.cuda.amp.autocast(enabled=DEVICE.type == "cuda"):
-            logits = model(
-                input_ids=encoder_input,
-                attention_mask=encoder_mask,
-                decoder_input_ids=decoder_input,
-            )["logits"]
-            loss = criterion(logits.view(-1, logits.size(-1)), decoder_targets.view(-1))
-
-        scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        if scheduler is not None:
-            scheduler.step()
-
-        with torch.no_grad():
-            non_pad = (decoder_targets != PAD_IDX).sum().item()
-            total_loss += loss.item() * max(1, non_pad)
-            total_tokens += max(1, non_pad)
-
-    return total_loss / max(1, total_tokens)
-
-
-def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
-    """
-    Dev: CE loss + batched k-best generation + (optional) rerank vs GT + metrics.
-    Uses fast params during training epochs if --fast_eval is set; the final dev eval (in main) uses full params.
-    """
-    model.eval()
-    # 1) CE on dev
-    ce_loss, total_tokens = 0.0, 0
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    with torch.no_grad():
-        for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(dev_loader, desc="Eval/CE"):
-            encoder_input = encoder_input.to(DEVICE)
-            encoder_mask = encoder_mask.to(DEVICE)
-            decoder_input = decoder_input.to(DEVICE)
-            decoder_targets = decoder_targets.to(DEVICE)
-            logits = model(
-                input_ids=encoder_input,
-                attention_mask=encoder_mask,
-                decoder_input_ids=decoder_input,
-            ).logits
-            loss = criterion(logits.view(-1, logits.size(-1)), decoder_targets.view(-1))
-            ntoks = (decoder_targets != PAD_IDX).sum().item()
-            ce_loss += loss.item() * max(1, ntoks)
-            total_tokens += max(1, ntoks)
-    ce_loss = ce_loss / max(1, total_tokens)
-
-    # 2) Generation params (fast vs full)
-    tok = get_tokenizer()
-    if args.fast_eval:
-        k = max(1, args.train_eval_k)
-        beams = max(1, args.train_eval_beams)
-        max_new = max(8, args.train_eval_max_new)
-    else:
-        k = max(1, args.num_return_sequences)
-        beams = max(1, args.gen_beam_size)
-        max_new = max(8, args.gen_max_new_tokens)
-
-    gen_cfg = GenerationConfig(
-        max_new_tokens=max_new,
-        num_beams=beams,
-        num_return_sequences=k,
-        do_sample=False,
-        length_penalty=args.length_penalty,
-        no_repeat_ngram_size=args.no_repeat_ngram_size,
-        repetition_penalty=args.repetition_penalty,
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id,
-        decoder_start_token_id=tok.pad_token_id,
+    dev_loss, record_f1, record_em, sql_em, err_rate = eval_epoch(
+        model, tokenizer, dev_loader, dev_sql_strings, args
     )
-
-    # 3) Load GT records once
-    import pickle
-    with open(gt_record_path, "rb") as f:
-        gt_recs, gt_errs = pickle.load(f)
-
-    sql_preds = []
-    err_msgs_accum = []
-    ex_idx = 0
-
-    from utils import compute_records, compute_record_F1
-
-    with torch.no_grad():
-        for batch in tqdm(dev_loader, desc="Generate"):
-            # unpack batch (supports both 5-tuple or 3-tuple)
-            if isinstance(batch, (list, tuple)):
-                if len(batch) == 5:
-                    encoder_input, encoder_mask, _, _, _ = batch
-                elif len(batch) == 3:
-                    encoder_input, encoder_mask, _ = batch
-                else:
-                    raise ValueError(f"Unexpected batch length: {len(batch)}")
-            else:
-                raise ValueError("Batch must be tuple/list.")
-
-            encoder_input = encoder_input.to(DEVICE)
-            encoder_mask = encoder_mask.to(DEVICE)
-            B = encoder_input.size(0)
-
-            all_cands = _batch_generate_k(
-                model, tok, encoder_input, encoder_mask, gen_cfg, k, do_repair=args.repair_sql
-            )
-
-            # Rerank per example
-            for i in range(B):
-                cands = all_cands[i]  # k SQL strings
-                recs, errs = compute_records(cands)
-
-                if args.rerank_dev_by_gt and ex_idx < len(gt_recs):
-                    gt_rows = gt_recs[ex_idx]
-                    best_q = cands[0]
-                    best_score = (-1.0, 0, 0)  # (F1, is_executable, -len(q) prefer shorter)
-                    for q, r, e in zip(cands, recs, errs):
-                        f1 = compute_record_F1([gt_rows], [r])
-                        score = (f1, int(e == ""), -len(q))
-                        if score > best_score:
-                            best_score = score
-                            best_q = q
-                    sql_preds.append(best_q)
-                    chosen_idx = cands.index(best_q)
-                    err_msgs_accum.append(errs[chosen_idx])
-                else:
-                    # No GT: prefer executable & non-empty
-                    picked = None
-                    for q, r, e in zip(cands, recs, errs):
-                        if not e and r:
-                            picked = q
-                            err_msgs_accum.append(e)
-                            break
-                    if picked is None:
-                        for q, r, e in zip(cands, recs, errs):
-                            if not e:
-                                picked = q
-                                err_msgs_accum.append(e)
-                                break
-                    if picked is None:
-                        picked = cands[0]
-                        err_msgs_accum.append(errs[0])
-                    sql_preds.append(picked)
-
-                ex_idx += 1
-
-    # Save + score
-    os.makedirs(os.path.dirname(model_sql_path), exist_ok=True)
-    os.makedirs(os.path.dirname(model_record_path), exist_ok=True)
-    save_queries_and_records(sql_preds, model_sql_path, model_record_path)
-
-    sql_em, record_em, record_f1, model_error_msgs = compute_metrics(
-        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    print(
+        f"Dev set results: Loss: {dev_loss:.4f}, "
+        f"Record F1: {record_f1:.4f}, "
+        f"Record EM: {record_em:.4f}, "
+        f"SQL EM: {sql_em:.4f}"
     )
-
-    # If compute_metrics doesn't return per-example errors, fall back to ours
-    if not model_error_msgs:
-        model_error_msgs = err_msgs_accum
-
-    bad = [(i, e) for i, e in enumerate(model_error_msgs) if e]
-    if bad:
-        print(f"[DEBUG] {len(bad)} / {len(model_error_msgs)} dev preds raised DB errors")
-        for i, e in bad[:10]:
-            print(f"[DEBUG] idx={i} err={e}")
-
-    error_rate = sum(1 for e in (model_error_msgs or []) if e) / max(1, len(model_error_msgs or []))
-    return ce_loss, record_f1, record_em, sql_em, error_rate
-
-
-def test_inference(args, model, test_loader, model_sql_path, model_record_path):
-    """
-    Test: batch-generate k candidates per example + prefer executable (and non-empty) candidate.
-    """
-    model.eval()
-    tok = get_tokenizer()
-    k = max(1, args.num_return_sequences)
-    beams = max(1, args.gen_beam_size)
-    max_new = max(8, args.gen_max_new_tokens)
-
-    gen_cfg = GenerationConfig(
-        max_new_tokens=max_new,
-        num_beams=beams,
-        num_return_sequences=k,
-        do_sample=False,
-        length_penalty=args.length_penalty,
-        no_repeat_ngram_size=args.no_repeat_ngram_size,
-        repetition_penalty=args.repetition_penalty,
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id,
-        decoder_start_token_id=tok.pad_token_id,
-    )
-
-    from utils import compute_records
-
-    sql_preds = []
-    with torch.no_grad():
-        for encoder_input, encoder_mask, _ in tqdm(test_loader, desc="Generate/Test"):
-            encoder_input = encoder_input.to(DEVICE)
-            encoder_mask = encoder_mask.to(DEVICE)
-            B = encoder_input.size(0)
-
-            all_cands = _batch_generate_k(
-                model, tok, encoder_input, encoder_mask, gen_cfg, k, do_repair=args.repair_sql
-            )
-
-            for i in range(B):
-                cands = all_cands[i]
-                recs, errs = compute_records(cands)
-
-                picked = None
-                if args.prefer_executable_on_test:
-                    for q, r, e in zip(cands, recs, errs):
-                        if not e and r:
-                            picked = q
-                            break
-                    if picked is None:
-                        for q, r, e in zip(cands, recs, errs):
-                            if not e:
-                                picked = q
-                                break
-                if picked is None:
-                    picked = cands[0]
-                sql_preds.append(picked)
-
-    os.makedirs(os.path.dirname(model_sql_path), exist_ok=True)
-    os.makedirs(os.path.dirname(model_record_path), exist_ok=True)
-    save_queries_and_records(sql_preds, model_sql_path, model_record_path)
-
-
-def main():
-    args = get_args()
-    if args.use_wandb and wandb is not None:
-        setup_wandb(args)
-
-    # Data + model
-    train_loader, dev_loader, test_loader = load_t5_data(args.batch_size, args.test_batch_size)
-    model = initialize_model(args).to(DEVICE)
-    optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
-
-    # Train (between-epoch eval can be sped up with --fast_eval)
-    train(args, model, train_loader, dev_loader, optimizer, scheduler)
-
-    # Evaluate best on dev and produce test submission files (full params, NOT fast_eval)
-    model = load_model_from_checkpoint(args, best=True, fallback_model=model).to(DEVICE)
-    model.eval()
-
-    experiment_name = args.experiment_name
-    model_type = "ft" if args.finetune else "scr"
-    gt_sql_path = os.path.join(DATA_DIR, "dev.sql")
-    gt_record_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
-    model_sql_path = os.path.join(RESULTS_DIR, f"t5_{model_type}_{experiment_name}.sql")
-    model_record_path = os.path.join(RECORDS_DIR, f"t5_{model_type}_{experiment_name}.pkl")
-
-    # Ensure final dev eval runs with full beams/k (ignore --fast_eval here)
-    was_fast = args.fast_eval
-    args.fast_eval = False
-    dev_loss, dev_record_f1, dev_record_em, dev_sql_em, dev_error_rate = eval_epoch(
-        args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path
-    )
-    args.fast_eval = was_fast
-
-    print(f"Dev set results: Loss: {dev_loss:.4f}, Record F1: {dev_record_f1:.4f}, "
-          f"Record EM: {dev_record_em:.4f}, SQL EM: {dev_sql_em:.4f}")
-    print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
-
-    # Test generation + records => SUBMISSION FILES
-    test_sql_path = os.path.join(RESULTS_DIR, f"t5_{model_type}_{experiment_name}_test.sql")
-    test_record_path = os.path.join(RECORDS_DIR, f"t5_{model_type}_{experiment_name}_test.pkl")
-    test_inference(args, model, test_loader, test_sql_path, test_record_path)
-    print(f"[SUBMISSION] Wrote: {test_sql_path}")
-    print(f"[SUBMISSION] Wrote: {test_record_path}")
-
+    print(f"Dev set results: {err_rate * 100:.2f}% of the generated outputs led to SQL errors")
 
 if __name__ == "__main__":
     main()
