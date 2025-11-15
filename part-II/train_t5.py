@@ -6,23 +6,22 @@ import pickle
 from typing import List, Tuple
 
 import torch
-from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     T5ForConditionalGeneration,
     T5TokenizerFast,
     get_scheduler,
 )
-
 from tqdm.auto import tqdm
 
-from utils import compute_records
+from utils import compute_records, save_queries_and_records
 
 # ----------------- Paths / constants -----------------
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR    = os.path.join(SCRIPT_DIR, "data")
 RECORDS_DIR = os.path.join(SCRIPT_DIR, "records")
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -46,10 +45,8 @@ _SQL_KW = {
 }
 
 def _strip_comments_and_weird(sql: str) -> str:
-    # Drop C- and SQL-style comments
     s = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     s = re.sub(r"--.*?$", " ", s, flags=re.MULTILINE)
-    # Remove backticks and weird quotes that T5 might have hallucinated
     s = s.replace("`", " ").replace("“", '"').replace("”", '"')
     return s
 
@@ -80,14 +77,14 @@ def _caps_keywords(sql: str) -> str:
     return s
 
 def _basic_column_fixes(sql: str) -> str:
-    # Fix things like "airport_" -> "airport"
+    # Fix "airport_" etc.
     s = re.sub(r"\b([A-Za-z]+)_\b", r"\1", sql)
 
     # Fix "AND =" or "= AND"
     s = re.sub(r"\bAND\s*=\s*", " AND ", s, flags=re.IGNORECASE)
     s = re.sub(r"\b=\s*AND\b", " AND ", s, flags=re.IGNORECASE)
 
-    # Drop spurious "TO" between identifiers/numbers (often junk)
+    # Drop spurious "TO" between identifiers/numbers
     s = re.sub(r"(\b[0-9A-Za-z_]+\b)\s+TO\s+(\b[0-9A-Za-z_]+\b)", r"\1 \2", s, flags=re.IGNORECASE)
 
     # Drop dangling AND / WHERE / ON at the end
@@ -106,27 +103,21 @@ def repair_sql(sql: str) -> str:
     if not s:
         return "SELECT 1;"
 
-    # 1) Generic cleanup
     s = _strip_comments_and_weird(s)
     s = _single_statement(s)
     s = _ensure_select(s)
     s = _squeeze_ws(s)
-
-    # 2) Keyword casing + column fixes
     s = _caps_keywords(s)
     s = _basic_column_fixes(s)
 
-    # 3) Guarantee trailing ';'
     if not s.endswith(";"):
         s = s + ";"
 
-    # Last guard: if we somehow lost SELECT, fallback
     if not re.match(r"(?is)^\s*SELECT\b", s):
         return "SELECT 1;"
     return s
 
 def extract_sql_like(text: str) -> str:
-    """Try to extract a SELECT statement from arbitrary model text."""
     if not text:
         return ""
     m = re.search(r"(?is)(select\b.*)", text)
@@ -137,7 +128,7 @@ def extract_sql_like(text: str) -> str:
 # ----------------- Data loading -----------------
 
 class ATIST5Dataset(Dataset):
-    def __init__(self, tokenizer, nl_lines: List[str], sql_lines: List[str] | None, schema_text: str | None):
+    def __init__(self, tokenizer, nl_lines, sql_lines, schema_text: str | None):
         self.tokenizer = tokenizer
         self.nl = nl_lines
         self.sql = sql_lines
@@ -176,11 +167,11 @@ class ATIST5Dataset(Dataset):
             item["labels"] = tgt["input_ids"]
         return item
 
-def _read_lines(path: str) -> List[str]:
+def _read_lines(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return [ln.rstrip("\n") for ln in f]
 
-def build_datasets(tokenizer) -> Tuple[Dataset, Dataset, Dataset, List[str]]:
+def build_datasets(tokenizer):
     train_nl = _read_lines(os.path.join(DATA_DIR, "train.nl"))
     train_sql = _read_lines(os.path.join(DATA_DIR, "train.sql"))
 
@@ -250,7 +241,6 @@ def build_dataloaders(tokenizer, args):
 # ----------------- Metrics -----------------
 
 def _records_to_set(rec) -> set:
-    # rec is list of rows; convert to set-of-tuples for comparison
     return set(tuple(r) for r in (rec or []))
 
 def _f1_from_sets(pred_set: set, gold_set: set) -> float:
@@ -266,25 +256,17 @@ def _f1_from_sets(pred_set: set, gold_set: set) -> float:
 def evaluate_predictions(
     gold_records,
     gold_errors,
-    gold_sql_strings: List[str],
-    pred_sql_candidates: List[List[str]],
+    gold_sql_strings,
+    pred_sql_candidates,
     rerank_by_gt: bool,
-    prefer_executable_on_test: bool,
 ):
-    """
-    gold_records: list of lists of rows (from ground_truth_dev.pkl)
-    gold_errors: list of error messages ("" on success)
-    gold_sql_strings: dev.sql lines (sanitized)
-    pred_sql_candidates: [N][k] SQL strings
-    """
     from utils import compute_records
 
     N = len(pred_sql_candidates)
     if len(gold_records) != N:
         raise ValueError(f"Mismatch: gold_records={len(gold_records)} candidates={N}")
 
-    # Flatten all candidates to run through DB at once
-    flat_sqls: List[str] = []
+    flat_sqls = []
     for i in range(N):
         for s in pred_sql_candidates[i]:
             flat_sqls.append(s)
@@ -324,7 +306,6 @@ def evaluate_predictions(
             score = f1
 
             if rerank_by_gt:
-                # Rerank by F1, then by EM, then by "no error"
                 if (score > best_score or
                     (math.isclose(score, best_score) and rec_em > best_em) or
                     (math.isclose(score, best_score) and rec_em == best_em and not err_flag and best_err_flag)):
@@ -334,7 +315,6 @@ def evaluate_predictions(
                     best_sql_eq = sql_em
                     best_err_flag = err_flag
             else:
-                # Use first candidate only
                 if j == 0:
                     best_score = f1
                     best_em = rec_em
@@ -357,7 +337,7 @@ def evaluate_predictions(
 
 # ----------------- Train / eval loops -----------------
 
-def train_epoch(model, loader, optimizer, lr_scheduler, tokenizer) -> float:
+def train_epoch(model, loader, optimizer, lr_scheduler) -> float:
     model.train()
     total_loss = 0.0
     n_steps = 0
@@ -390,9 +370,9 @@ def generate_candidates(
     num_return_sequences: int,
     gen_max_new_tokens: int,
     apply_repair: bool,
-) -> List[List[str]]:
+):
     model.eval()
-    all_candidates: List[List[str]] = []
+    all_candidates = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[ft][gen]", leave=False):
@@ -407,7 +387,6 @@ def generate_candidates(
                 num_return_sequences=num_return_sequences,
                 early_stopping=True,
             )
-            # outputs: (batch_size * k, seq_len)
             decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
             bs = input_ids.size(0)
@@ -432,13 +411,12 @@ def eval_epoch(
     dev_loader,
     dev_sql_strings,
     args,
-    loss_only: bool = False,
 ):
     model.eval()
     total_loss = 0.0
     n_steps = 0
 
-    # For loss computation we need labels
+    # Loss-only pass
     for batch in tqdm(dev_loader, desc="[ft][dev-loss]", leave=False):
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
         with torch.no_grad():
@@ -449,10 +427,6 @@ def eval_epoch(
 
     dev_loss = total_loss / max(1, n_steps)
 
-    if loss_only:
-        return dev_loss, 0.0, 0.0, 0.0, 1.0
-
-    # Load ground truth records
     gt_pkl_path = os.path.join(RECORDS_DIR, "ground_truth_dev.pkl")
     if not os.path.exists(gt_pkl_path):
         raise FileNotFoundError(
@@ -462,7 +436,6 @@ def eval_epoch(
     with open(gt_pkl_path, "rb") as f:
         gold_records, gold_errors = pickle.load(f)
 
-    # Generate candidates
     candidates = generate_candidates(
         model=model,
         tokenizer=tokenizer,
@@ -473,17 +446,14 @@ def eval_epoch(
         apply_repair=args.repair_sql,
     )
 
-    # Evaluate
     record_f1, record_em, sql_em, err_rate = evaluate_predictions(
         gold_records=gold_records,
         gold_errors=gold_errors,
         gold_sql_strings=dev_sql_strings,
         pred_sql_candidates=candidates,
         rerank_by_gt=args.rerank_dev_by_gt,
-        prefer_executable_on_test=args.prefer_executable_on_test,
     )
 
-    # Debug: show error fraction
     print(f"[DEBUG] Dev SQL error rate: {err_rate * 100:.2f}%")
 
     return dev_loss, record_f1, record_em, sql_em, err_rate
@@ -493,7 +463,6 @@ def eval_epoch(
 def parse_args():
     p = argparse.ArgumentParser()
 
-    # Training / finetuning
     p.add_argument("--finetune", action="store_true",
                    help="Start from pretrained google-t5/t5-small")
     p.add_argument("--learning_rate", type=float, default=1e-4)
@@ -505,20 +474,16 @@ def parse_args():
     p.add_argument("--patience_epochs", type=int, default=3)
     p.add_argument("--seed", type=int, default=3407)
 
-    # Generation / decoding
     p.add_argument("--gen_beam_size", type=int, default=8)
     p.add_argument("--num_return_sequences", type=int, default=8)
     p.add_argument("--gen_max_new_tokens", type=int, default=128)
 
-    # Evaluation strategy
     p.add_argument("--rerank_dev_by_gt", action="store_true",
                    help="Use ground-truth records to rerank dev candidates.")
     p.add_argument("--repair_sql", action="store_true",
                    help="Apply SQL repair to each generated candidate.")
-    p.add_argument("--prefer_executable_on_test", action="store_true",
-                   help="(Placeholder; behavior folded into evaluate_predictions).")
 
-    p.add_argument("--experiment_name", type=str, default="t5_ft_default")
+    p.add_argument("--experiment_name", type=str, default="dev")
 
     return p.parse_args()
 
@@ -535,9 +500,11 @@ def main():
     model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
     model.to(DEVICE)
 
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(RECORDS_DIR, exist_ok=True)
+
     train_loader, dev_loader, test_loader, dev_sql_strings = build_dataloaders(tokenizer, args)
 
-    # Optimizer / scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     n_train_steps = len(train_loader) * args.max_n_epochs
     if args.scheduler_type == "linear":
@@ -556,7 +523,7 @@ def main():
 
     for epoch in range(args.max_n_epochs):
         print(f"[ft][train] Epoch {epoch}")
-        tr_loss = train_epoch(model, train_loader, optimizer, lr_scheduler, tokenizer)
+        tr_loss = train_epoch(model, train_loader, optimizer, lr_scheduler)
 
         dev_loss, record_f1, record_em, sql_em, err_rate = eval_epoch(
             model, tokenizer, dev_loader, dev_sql_strings, args
@@ -570,17 +537,11 @@ def main():
             f"SQL EM {sql_em:.4f}"
         )
 
-        # Save last state
-        ckpt_dir = os.path.join(SCRIPT_DIR, "checkpoints", "ft_experiments", args.experiment_name)
-        os.makedirs(ckpt_dir, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(ckpt_dir, "last.pt"))
-
         improved = record_f1 > best_f1
         if improved:
             best_f1 = record_f1
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_since_improvement = 0
-            torch.save(best_state, os.path.join(ckpt_dir, "best.pt"))
             print(f"[ft][dev] Epoch {epoch}: new best Record F1={best_f1:.4f}")
         else:
             epochs_since_improvement += 1
@@ -589,7 +550,7 @@ def main():
             print(f"[ft] Early stopping after {epoch} epochs (no improvement for {epochs_since_improvement}).")
             break
 
-    # Final dev evaluation with best model
+    # Load best state for final dev eval + test generation
     if best_state is not None:
         model.load_state_dict(best_state)
         model.to(DEVICE)
@@ -604,6 +565,34 @@ def main():
         f"SQL EM: {sql_em:.4f}"
     )
     print(f"Dev set results: {err_rate * 100:.2f}% of the generated outputs led to SQL errors")
+
+    # ---------- Generate & SAVE TEST FILES FOR SUBMISSION ----------
+    print("[ft][test] Generating SQL for test set and saving submission files ...")
+
+    # For test, we only need ONE best query per example
+    test_candidates = generate_candidates(
+        model=model,
+        tokenizer=tokenizer,
+        loader=test_loader,
+        gen_beam_size=args.gen_beam_size,
+        num_return_sequences=1,          # single best candidate per test example
+        gen_max_new_tokens=args.gen_max_new_tokens,
+        apply_repair=args.repair_sql,
+    )
+
+    # Flatten [N][1] -> [N]
+    test_sql_preds = [c[0] for c in test_candidates]
+
+    basename = f"t5_ft_{args.experiment_name}_test"
+    sql_path = os.path.join(RESULTS_DIR, f"{basename}.sql}")
+    rec_path = os.path.join(RECORDS_DIR, f"{basename}.pkl}")
+
+    # Save queries + records using the provided helper
+    save_queries_and_records(test_sql_preds, sql_path, rec_path)
+
+    print(f"[ft][test] Saved SQL to: {sql_path}")
+    print(f"[ft][test] Saved records to: {rec_path}")
+    print("[ft][test] You can now run evaluate.py on dev, and upload these two test files to Gradescope.")
 
 if __name__ == "__main__":
     main()
